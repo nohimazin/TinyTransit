@@ -1,0 +1,13 @@
+以下は実稼働中のバス会社のGTFSデータのリンク集です。誤って異常な負荷をかけ続けないように注意してください。
+
+
+## データダウンロード
+各社の標準的なバス情報フォーマット形式のデータはこちらからダウンロードしてください。
+ 産交バス：https://km.bus-vision.jp/gtfs/sankobus/gtfsFeed
+
+
+
+## GTFS Realtime
+GTFS Realtime形式のデータはこちらからダウンロードしてください。
+ 産交バス（TripUpdate）：https://km.bus-vision.jp/realtime/sankobus_trip_update.bin
+ 産交バス（VehiclePosition）：https://km.bus-vision.jp/realtime/sankobus_vpos_update.bin
