@@ -142,6 +142,8 @@ Androidの `ConnectivityManager` と `NetworkCapabilities` を利用します。
 
 必要な権限は `ACCESS_NETWORK_STATE` です。
 
+`ConnectivityManager.getActiveNetwork()` は API 23 以降のため、Android 5.0/5.1（API 21-22）では `getAllNetworks()` 経由のフォールバックを実装します。
+
 ### 3.4 静的GTFSの更新
 
 静的GTFSは原則としてWi-Fi接続中に更新します。
@@ -174,6 +176,8 @@ Androidアプリとして、Kotlinを中心とした軽量な構成にします�
 | OkHttp            | HTTP通信          |
 | Protocol Buffers  | GTFS-Realtime解析 |
 | Kotlin Coroutines | 非同期処理           |
+
+最低 Android バージョンは Android 5.0（API 21）です。Jetpack Compose と OkHttp 5 が API 21 を要求するため、これが技術的な下限となります。Android 4.4（API 19/20）対応は Compose の放棄が必要になるため、コスト対効果が悪く非推奨です。Android 9（API 28）以上の要件もこの範囲に含まれます。
 
 アーキテクチャは、UIとデータ処理を分離した構成を採用します。
 
@@ -372,6 +376,8 @@ TinyTransit
 | モバイル回線での静的GTFS更新 | 原則ユーザー許可制         |
 | 地図               | 初期版では実装しない        |
 | 複数事業者            | 初期設計から対応          |
+| 最低 Android バージョン | Android 5.0 (API 21)（Compose / OkHttp 5 の要求に合わせる） |
+| ターゲット Android バージョン | 最新安定版（Play 配布時は Google Play の targetSdk 要件に合わせる） |
 
 開発上の最優先事項は、まず到着予測の正確性を確保することです。
 
