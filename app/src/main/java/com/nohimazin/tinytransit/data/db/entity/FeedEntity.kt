@@ -12,6 +12,7 @@ data class FeedEntity(
     @PrimaryKey
     val feedId: String,
     val name: String,
+    val agencyTimezone: String? = null,
     val staticGtfsUrl: String?,
     val tripUpdateUrl: String?,
     val vehiclePositionUrl: String?,

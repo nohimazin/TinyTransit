@@ -20,7 +20,8 @@ data class ArrivalPrediction(
     val delaySeconds: Int?,
     val isSkipped: Boolean,
     val isCanceled: Boolean,
-    val feedTimestamp: Long?
+    val feedTimestamp: Long?,
+    val agencyTimezone: String? = null
 ) {
     /**
      * 予測到着時刻のエポック秒を返します。
@@ -39,7 +40,8 @@ data class ArrivalPrediction(
     fun predictedTimeText(): String {
         val epoch = predictedArrivalEpoch ?: return "--:--"
         val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
-        sdf.timeZone = TimeZone.getDefault()
+        // GTFS-Realtime の time は Unix epoch (UTC)。事業者のタイムゾーンで表示する。
+        sdf.timeZone = TimeZone.getTimeZone(agencyTimezone ?: "Asia/Tokyo")
         return sdf.format(Date(epoch * 1000))
     }
 

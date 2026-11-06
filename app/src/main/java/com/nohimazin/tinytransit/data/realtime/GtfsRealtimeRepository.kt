@@ -42,6 +42,9 @@ class GtfsRealtimeRepository(
         val feedMessage = GtfsRealtime.FeedMessage.parseFrom(bytes)
 
         // 3. TripUpdate → ArrivalPrediction に変換
+        // 事業者のタイムゾーンを DB から取得
+        val agencyTimezone = database.feedDao().get(feedId)?.agencyTimezone
+
         val predictions = mutableListOf<ArrivalPrediction>()
         val feedTimestamp = feedMessage.header.timestamp.takeIf { it > 0 }
 
@@ -85,7 +88,8 @@ class GtfsRealtimeRepository(
                         delaySeconds = delay,
                         isSkipped = isSkipped,
                         isCanceled = isCanceled,
-                        feedTimestamp = feedTimestamp
+                        feedTimestamp = feedTimestamp,
+                        agencyTimezone = agencyTimezone
                     )
                 )
             }

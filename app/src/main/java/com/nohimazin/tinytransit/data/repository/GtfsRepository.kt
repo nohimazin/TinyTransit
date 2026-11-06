@@ -68,6 +68,10 @@ class GtfsRepository(
         val feedInfo = GtfsCsvReader.parse(readCsv("feed_info.txt"))
         val feedInfoRow = feedInfo.firstOrNull()
 
+        // agency.txt からタイムゾーンを取得
+        val agencyRows = GtfsCsvReader.parse(readCsv("agency.txt"))
+        val agencyTimezone = agencyRows.firstOrNull()?.get("agency_timezone")
+
         // 4a. stop_times: bulk insert via multi-row INSERT in its own transaction
         onProgress(0.35f, "Loading stop_times...")
         val stopTimesFile = File(extractedDir, "stop_times.txt")
@@ -184,6 +188,7 @@ class GtfsRepository(
                 FeedEntity(
                     feedId = feedId,
                     name = feedInfoRow?.get("feed_publisher_name") ?: feedId,
+                    agencyTimezone = agencyTimezone,
                     staticGtfsUrl = url,
                     tripUpdateUrl = null,
                     vehiclePositionUrl = null,
