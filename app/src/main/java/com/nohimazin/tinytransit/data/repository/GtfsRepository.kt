@@ -255,6 +255,28 @@ class GtfsRepository(
         return if (f.exists()) f.readText(Charsets.UTF_8) else ""
     }
 
+    /**
+     * 停留所名で検索します。
+     */
+    suspend fun searchStops(feedId: String, query: String): List<com.nohimazin.tinytransit.data.db.entity.StopEntity> =
+        withContext(Dispatchers.IO) {
+            if (query.isBlank()) emptyList()
+            else database.stopDao().searchByName(feedId, query, 20)
+        }
+
+    /**
+     * 指定された停留所に乗り入れる路線一覧を取得します。
+     */
+    suspend fun getRoutesForStop(feedId: String, stopId: String): List<com.nohimazin.tinytransit.data.db.entity.RouteEntity> =
+        withContext(Dispatchers.IO) {
+            val stopTimes = database.stopTimeDao().getByStop(feedId, stopId)
+            val tripIds = stopTimes.map { it.tripId }.distinct()
+            val routeIds = tripIds.mapNotNull { tid ->
+                database.tripDao().get(feedId, tid)?.routeId
+            }.distinct()
+            routeIds.mapNotNull { rid -> database.routeDao().get(feedId, rid) }
+        }
+
     suspend fun verifyDataIntegrity(feedId: String): com.nohimazin.tinytransit.data.verification.GtfsVerificationResult =
         withContext(Dispatchers.IO) {
             val stopCount = database.stopDao().count(feedId)
