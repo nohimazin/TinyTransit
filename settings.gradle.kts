@@ -23,3 +23,4 @@ dependencyResolutionManagement {
 }
 
 rootProject.name = "TinyTransit"
+include(":app")
