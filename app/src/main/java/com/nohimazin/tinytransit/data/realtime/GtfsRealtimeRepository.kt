@@ -115,6 +115,111 @@ class GtfsRealtimeRepository(
     }
 
     /**
+     * GTFS-Realtime と静的 GTFS の照合結果を検証します。
+     */
+    suspend fun verifyRealtimeIntegrity(
+        feedId: String,
+        url: String
+    ): GtfsRealtimeVerificationResult = withContext(Dispatchers.IO) {
+        val predictions = fetchAndDecodeTripUpdates(feedId, url)
+
+        // trip_id の照合
+        val routeIds = database.routeDao().getAll(feedId).map { it.routeId }.toSet()
+        val allTrips = database.routeDao().getAll(feedId).flatMap { r ->
+            database.tripDao().getByRoute(feedId, r.routeId)
+        }
+        val tripIds = allTrips.map { it.tripId }.toSet()
+
+        var tripMatched = 0
+        var tripUnmatched = 0
+        val tripUpdateCount = predictions.map { it.tripId }.distinct().size
+
+        for (tripId in predictions.map { it.tripId }.distinct()) {
+            if (tripId in tripIds) tripMatched++ else tripUnmatched++
+        }
+
+        // StopTimeUpdate の照合
+        var stopMatched = 0
+        var stopSeqMismatch = 0
+        var stopIdMismatch = 0
+        var stopUnmatched = 0
+        var bothConsistent = 0
+        var bothInconsistent = 0
+        var skippedCount = 0
+        var canceledCount = 0
+        var predictedValid = 0
+        var predictedInvalid = 0
+
+        for (p in predictions) {
+            if (p.isSkipped) skippedCount++
+            if (p.isCanceled) canceledCount++
+
+            // predicted time の妥当性
+            if (p.predictedArrivalEpoch != null && p.predictedArrivalEpoch > 0) {
+                predictedValid++
+            } else {
+                predictedInvalid++
+            }
+
+            val stopTimes = database.stopTimeDao().getByTrip(feedId, p.tripId)
+            if (stopTimes.isEmpty()) {
+                stopUnmatched++
+                continue
+            }
+
+            // stop_sequence で照合
+            val bySeq = if (p.stopSequence != null) {
+                stopTimes.firstOrNull { it.stopSequence == p.stopSequence }
+            } else null
+
+            // stop_id で照合
+            val byId = if (p.stopId.isNotEmpty()) {
+                stopTimes.firstOrNull { it.stopId == p.stopId }
+            } else null
+
+            val seqOk = bySeq != null
+            val idOk = byId != null
+
+            if (seqOk && idOk) {
+                // 両方存在する場合、同じ停車情報を指すか
+                if (bySeq!!.stopId == p.stopId || byId!!.stopSequence == p.stopSequence) {
+                    bothConsistent++
+                } else {
+                    bothInconsistent++
+                }
+                stopMatched++
+            } else if (seqOk) {
+                stopMatched++
+                if (!idOk) stopIdMismatch++
+            } else if (idOk) {
+                stopMatched++
+                if (!seqOk) stopSeqMismatch++
+            } else {
+                stopUnmatched++
+            }
+        }
+
+        GtfsRealtimeVerificationResult(
+            feedId = feedId,
+            tripUpdateCount = tripUpdateCount,
+            stopTimeUpdateCount = predictions.size,
+            tripIdMatched = tripMatched,
+            tripIdUnmatched = tripUnmatched,
+            stopMatched = stopMatched,
+            stopSequenceMismatch = stopSeqMismatch,
+            stopIdMismatch = stopIdMismatch,
+            stopUnmatched = stopUnmatched,
+            stopBothConsistent = bothConsistent,
+            stopBothInconsistent = bothInconsistent,
+            skippedCount = skippedCount,
+            canceledCount = canceledCount,
+            predictedTimeValid = predictedValid,
+            predictedTimeInvalid = predictedInvalid,
+            isConsistent = tripUnmatched == 0 && stopUnmatched == 0 && bothInconsistent == 0
+        )
+    }
+
+    /**
      * GTFS 時刻文字列 "HH:MM:SS" をサービス日開始からの経過秒数に変換します。
      * 24 時間超（例: 25:10:00）にも対応します。
      */

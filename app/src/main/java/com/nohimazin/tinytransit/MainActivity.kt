@@ -55,7 +55,9 @@ fun MainScreen(
     var importProgress by remember { mutableStateOf(0f) }
     var importRunning by remember { mutableStateOf(true) }
     var realtimeStatus by remember { mutableStateOf("") }
+    var verifyStatus by remember { mutableStateOf("") }
     var fetchTrigger by remember { mutableStateOf(0) }
+    var verifyTrigger by remember { mutableStateOf(0) }
 
     LaunchedEffect(Unit) {
         importRunning = true
@@ -95,6 +97,19 @@ fun MainScreen(
         }
     }
 
+    LaunchedEffect(verifyTrigger) {
+        if (verifyTrigger == 0) return@LaunchedEffect
+        try {
+            val result = realtimeRepository.verifyRealtimeIntegrity(
+                feedId = GtfsRepository.DEFAULT_FEED_ID,
+                url = "https://km.bus-vision.jp/realtime/sankobus_trip_update.bin"
+            )
+            verifyStatus = result.toString()
+        } catch (e: Exception) {
+            verifyStatus = "エラー: ${e.message}"
+        }
+    }
+
     Column(
         modifier = modifier.fillMaxSize(),
         verticalArrangement = Arrangement.Center,
@@ -109,9 +124,15 @@ fun MainScreen(
             Button(onClick = { fetchTrigger++ }) {
                 Text("TripUpdate を取得")
             }
+            Button(onClick = { verifyTrigger++ }) {
+                Text("照合結果を検証")
+            }
         }
         if (realtimeStatus.isNotEmpty()) {
             Text(text = realtimeStatus)
+        }
+        if (verifyStatus.isNotEmpty()) {
+            Text(text = verifyStatus)
         }
     }
 }
