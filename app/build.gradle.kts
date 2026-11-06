@@ -11,7 +11,7 @@ android {
 
     defaultConfig {
         applicationId = "com.nohimazin.tinytransit"
-        minSdk = 22
+        minSdk = 21
         targetSdk = 37
         versionCode = 1
         versionName = "1.0"
