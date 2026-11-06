@@ -11,6 +11,10 @@ interface StopTimeDao {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun upsertAll(stopTimes: List<StopTimeEntity>)
 
+    // バルクインポート用：deleteByFeed 後の挿入のため競合なし。IGNORE の方が高速。
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertAll(stopTimes: List<StopTimeEntity>)
+
     @Query("SELECT * FROM stop_times WHERE feedId = :feedId AND tripId = :tripId ORDER BY stopSequence ASC")
     suspend fun getByTrip(feedId: String, tripId: String): List<StopTimeEntity>
 

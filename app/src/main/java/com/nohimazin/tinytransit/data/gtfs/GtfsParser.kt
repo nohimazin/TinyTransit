@@ -66,6 +66,27 @@ object GtfsParser {
         }
     }
 
+    /**
+     * 1 行分のフィールドとヘッダーから StopTimeEntity を生成します。
+     * ストリーミングパース用。
+     */
+    fun parseStopTimeRow(feedId: String, fields: List<String>, header: List<String>): StopTimeEntity? {
+        val map = header.mapIndexed { i, name -> name to (fields.getOrElse(i) { "" }) }.toMap()
+        val tripId = map["trip_id"] ?: return null
+        if (tripId.isEmpty()) return null
+        return StopTimeEntity(
+            feedId = feedId,
+            tripId = tripId,
+            stopId = map["stop_id"] ?: "",
+            stopSequence = map["stop_sequence"]?.toIntOrNull() ?: 0,
+            arrivalTime = map["arrival_time"]?.takeIf { it.isNotEmpty() },
+            departureTime = map["departure_time"]?.takeIf { it.isNotEmpty() },
+            stopHeadsign = map["stop_headsign"]?.takeIf { it.isNotEmpty() },
+            pickupType = map["pickup_type"]?.toIntOrNull(),
+            dropOffType = map["drop_off_type"]?.toIntOrNull()
+        )
+    }
+
     fun parseStopTimes(feedId: String, csvText: String): List<StopTimeEntity> {
         return GtfsCsvReader.parse(csvText).map { row ->
             StopTimeEntity(

@@ -6,8 +6,55 @@ package com.nohimazin.tinytransit.data.gtfs
  */
 object GtfsCsvReader {
 
+    fun parseLine(line: String): List<String> {
+        val fields = mutableListOf<String>()
+        val sb = StringBuilder()
+        var inQuotes = false
+        var atFieldStart = true
+        var i = 0
+        val n = line.length
+        while (i < n) {
+            val c = line[i]
+            when {
+                inQuotes -> {
+                    if (c == '"') {
+                        if (i + 1 < n && line[i + 1] == '"') {
+                            sb.append('"')
+                            i++
+                        } else {
+                            inQuotes = false
+                        }
+                    } else {
+                        sb.append(c)
+                    }
+                }
+                c == '"' && atFieldStart -> {
+                    inQuotes = true
+                    atFieldStart = false
+                }
+                c == ',' -> {
+                    fields.add(sb.toString())
+                    sb.setLength(0)
+                    atFieldStart = true
+                }
+                c == '\r' -> {
+                    // ignore
+                }
+                else -> {
+                    sb.append(c)
+                    atFieldStart = false
+                }
+            }
+            i++
+        }
+        fields.add(sb.toString())
+        return fields
+    }
+
     fun parse(text: String): List<Map<String, String>> {
-        val rows = parseRows(text)
+        // UTF-8 BOM を除去
+        val cleaned = if (text.startsWith("\uFEFF")) text.substring(1) else text
+        val rows = parseRows(cleaned)
         if (rows.isEmpty()) return emptyList()
         val header = rows.first()
         val result = mutableListOf<Map<String, String>>()
