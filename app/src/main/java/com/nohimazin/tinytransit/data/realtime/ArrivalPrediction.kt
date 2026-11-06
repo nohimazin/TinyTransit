@@ -1,8 +1,9 @@
 package com.nohimazin.tinytransit.data.realtime
 
-import java.time.Instant
-import java.time.ZoneId
-import java.time.format.DateTimeFormatter
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
+import java.util.TimeZone
 
 /**
  * 到着予測データ。
@@ -35,9 +36,11 @@ data class ArrivalPrediction(
     /**
      * 予測到着時刻を "HH:MM" 形式で返します。
      */
-    fun predictedTimeText(zoneId: ZoneId = ZoneId.systemDefault()): String {
+    fun predictedTimeText(): String {
         val epoch = predictedArrivalEpoch ?: return "--:--"
-        return Instant.ofEpochSecond(epoch).atZone(zoneId).format(DateTimeFormatter.ofPattern("HH:mm"))
+        val sdf = SimpleDateFormat("HH:mm", Locale.getDefault())
+        sdf.timeZone = TimeZone.getDefault()
+        return sdf.format(Date(epoch * 1000))
     }
 
     /**
@@ -58,7 +61,7 @@ data class ArrivalPrediction(
      * あと何分かを返します。負の場合は null。
      */
     fun minutesUntil(nowEpoch: Long): Int? {
-        val pred = effectivePredictedEpoch(0) ?: return null
+        val pred = predictedArrivalEpoch ?: return null
         val diff = pred - nowEpoch
         if (diff < 0) return null
         return (diff / 60).toInt()

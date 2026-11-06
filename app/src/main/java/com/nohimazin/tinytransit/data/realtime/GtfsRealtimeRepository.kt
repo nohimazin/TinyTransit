@@ -220,6 +220,31 @@ class GtfsRealtimeRepository(
     }
 
     /**
+     * 特定停留所の到着予測を取得し、静的 GTFS の路線・便情報を付与して返します。
+     */
+    suspend fun getArrivalsForStop(
+        feedId: String,
+        stopId: String,
+        url: String
+    ): List<StopArrival> = withContext(Dispatchers.IO) {
+        val predictions = fetchAndDecodeTripUpdates(feedId, url)
+            .filter { it.stopId == stopId }
+
+        predictions.map { p ->
+            val trip = database.tripDao().get(feedId, p.tripId)
+            val route = trip?.let { database.routeDao().get(feedId, it.routeId) }
+            val stop = database.stopDao().get(feedId, p.stopId)
+            StopArrival(
+                prediction = p,
+                stopName = stop?.stopName,
+                routeShortName = route?.routeShortName,
+                routeLongName = route?.routeLongName,
+                tripHeadsign = trip?.tripHeadsign
+            )
+        }.sortedBy { it.prediction.effectivePredictedEpoch(0) ?: Long.MAX_VALUE }
+    }
+
+    /**
      * GTFS 時刻文字列 "HH:MM:SS" をサービス日開始からの経過秒数に変換します。
      * 24 時間超（例: 25:10:00）にも対応します。
      */
