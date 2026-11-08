@@ -100,6 +100,7 @@ fun MainScreen(
 
     var routesForStop by remember { mutableStateOf<List<com.nohimazin.tinytransit.data.db.entity.RouteEntity>>(emptyList()) }
     var selectedRouteId by remember { mutableStateOf<String?>(null) }
+    var routeSearchQuery by remember { mutableStateOf("") }
 
     var allArrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
     var arrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
@@ -108,6 +109,14 @@ fun MainScreen(
     var fetchTrigger by remember { mutableStateOf(0) }
 
     var monitoring by remember { mutableStateOf(RealtimeMonitorService.isRunning) }
+
+    // 通知から停止された場合もリアルタイムに反映するため、定期的に状態を同期
+    LaunchedEffect(Unit) {
+        while (true) {
+            monitoring = RealtimeMonitorService.isRunning
+            kotlinx.coroutines.delay(500)
+        }
+    }
 
     LaunchedEffect(Unit) {
         importRunning = true
@@ -225,6 +234,22 @@ fun MainScreen(
             // Route filter chips
             if (routesForStop.size > 1) {
                 item {
+                    OutlinedTextField(
+                        value = routeSearchQuery,
+                        onValueChange = { routeSearchQuery = it },
+                        label = { Text("路線名で絞り込み") },
+                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
+                    )
+                }
+                item {
+                    val filteredRoutes = if (routeSearchQuery.isBlank()) {
+                        routesForStop
+                    } else {
+                        routesForStop.filter { r ->
+                            (r.routeLongName ?: "").contains(routeSearchQuery, ignoreCase = true) ||
+                                (r.routeShortName ?: "").contains(routeSearchQuery, ignoreCase = true)
+                        }
+                    }
                     FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
                         verticalArrangement = Arrangement.spacedBy(4.dp),
@@ -239,7 +264,7 @@ fun MainScreen(
                             },
                             label = { Text("全て") }
                         )
-                        routesForStop.forEach { route ->
+                        filteredRoutes.forEach { route ->
                             FilterChip(
                                 selected = selectedRouteId == route.routeId,
                                 onClick = {

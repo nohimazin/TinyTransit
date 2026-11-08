@@ -181,12 +181,13 @@ class RealtimeMonitorService : Service() {
             PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
         )
 
-        val title = "TinyTransit - バックグラウンド監視中"
+        val title = buildNotificationTitle(stopName, predictions, lastUpdateEpoch)
         val content = buildNotificationContent(stopName, predictions, lastUpdateEpoch)
 
         return NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
             .setSmallIcon(android.R.drawable.ic_menu_mylocation)
             .setOngoing(true)
             .setOnlyAlertOnce(true)
@@ -194,6 +195,23 @@ class RealtimeMonitorService : Service() {
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止", stopPending)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
+
+    private fun buildNotificationTitle(
+        stopName: String?,
+        predictions: List<ArrivalPrediction>,
+        lastUpdateEpoch: Long?
+    ): String {
+        if (predictions.isEmpty()) return "到着予測なし"
+        val nearest = predictions.minByOrNull { it.predictedArrivalEpoch ?: Long.MAX_VALUE } ?: return "到着予測なし"
+        val mins = nearest.minutesUntil(System.currentTimeMillis() / 1000)
+        val minsText = if (mins != null) "あと${mins}分" else "到着済み"
+        val delay = nearest.delayText()
+        val ago = if (lastUpdateEpoch != null && lastUpdateEpoch > 0) {
+            val sec = (System.currentTimeMillis() - lastUpdateEpoch) / 1000
+            "${sec}秒前取得"
+        } else ""
+        return "$minsText・$delay・$ago".trim('・', ' ')
     }
 
     private fun buildNotificationContent(
@@ -210,13 +228,19 @@ class RealtimeMonitorService : Service() {
         } else {
             val nearest = predictions.minByOrNull { it.predictedArrivalEpoch ?: Long.MAX_VALUE }
             if (nearest != null) {
-                val route = nearest.routeId ?: ""
-                val headsign = "" // headsign は ArrivalPrediction に含まれないため省略
+                // 路線名を DB から取得
+                val app = application as TinyTransitApp
+                val route = nearest.routeId?.let { rid ->
+                    kotlinx.coroutines.runBlocking {
+                        app.database.routeDao().get(nearest.feedId, rid)
+                    }
+                }
+                val routeName = route?.routeLongName ?: route?.routeShortName ?: nearest.routeId ?: ""
                 val time = nearest.predictedTimeText()
                 val delay = nearest.delayText()
                 val mins = nearest.minutesUntil(System.currentTimeMillis() / 1000)
                 val minsText = if (mins != null) "あと${mins}分" else ""
-                sb.append("$route $headsign - $time ($delay) $minsText")
+                sb.append("$routeName - $time ($delay) $minsText")
             }
         }
         if (lastUpdateEpoch != null && lastUpdateEpoch > 0) {
