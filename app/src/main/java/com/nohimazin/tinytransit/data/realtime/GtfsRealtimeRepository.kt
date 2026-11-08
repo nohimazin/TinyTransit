@@ -54,9 +54,10 @@ class GtfsRealtimeRepository(
      */
     suspend fun fetchAndDecodeTripUpdates(
         feedId: String,
-        url: String
+        url: String,
+        onProgress: (Long, Long) -> Unit = { _, _ -> }
     ): List<ArrivalPrediction> {
-        val result = fetch(feedId, url)
+        val result = fetch(feedId, url, onProgress)
         return when (result) {
             is FetchResult.Success -> result.predictions
             else -> emptyList()
@@ -67,7 +68,11 @@ class GtfsRealtimeRepository(
      * HTTP 取得 + デコードを実行し、FetchResult を返します。
      * Single-flight パターンで重複取得を防止します。
      */
-    suspend fun fetch(feedId: String, url: String): FetchResult {
+    suspend fun fetch(
+        feedId: String,
+        url: String,
+        onProgress: (Long, Long) -> Unit = { _, _ -> }
+    ): FetchResult {
         val key = FetchKey(feedId, url)
 
         // Mutex で Deferred の取得/生成を保護
@@ -76,7 +81,7 @@ class GtfsRealtimeRepository(
                 if (existing.isActive) return@withLock existing
             }
             val newDeferred = applicationScope.async(start = kotlinx.coroutines.CoroutineStart.LAZY) {
-                doFetchAndDecode(feedId, url)
+                doFetchAndDecode(feedId, url, onProgress)
             }
             // 完了時にクリア（古い Deferred が新しいものを誤ってクリアしないよう参照比較）
             newDeferred.invokeOnCompletion {
@@ -100,7 +105,11 @@ class GtfsRealtimeRepository(
     /**
      * 実際の HTTP 取得・デコード処理。
      */
-    private suspend fun doFetchAndDecode(feedId: String, url: String): FetchResult {
+    private suspend fun doFetchAndDecode(
+        feedId: String,
+        url: String,
+        onProgress: (Long, Long) -> Unit = { _, _ -> }
+    ): FetchResult {
         return try {
             val request = Request.Builder().url(url).build()
             val response = httpClient.newCall(request).execute()
@@ -122,8 +131,20 @@ class GtfsRealtimeRepository(
                 )
             }
 
-            val bodyBytes = response.body?.bytes()
-                ?: return FetchResult.NetworkError(IOException("Empty response body"))
+            val body = response.body ?: return FetchResult.NetworkError(IOException("Empty response body"))
+            val contentLength = body.contentLength()
+            val outputStream = java.io.ByteArrayOutputStream()
+            body.byteStream().use { input ->
+                val buffer = ByteArray(8192)
+                var totalRead = 0L
+                var read: Int
+                while (input.read(buffer).also { read = it } != -1) {
+                    outputStream.write(buffer, 0, read)
+                    totalRead += read
+                    onProgress(totalRead, contentLength)
+                }
+            }
+            val bodyBytes = outputStream.toByteArray()
             val receivedBytes = bodyBytes.size.toLong()
 
             // Protobuf デコード
@@ -160,6 +181,9 @@ class GtfsRealtimeRepository(
         val predictions = mutableListOf<ArrivalPrediction>()
         val feedTimestamp = feedMessage.header.timestamp.takeIf { it > 0 }
         val agencyTimezone = database.feedDao().get(feedId)?.agencyTimezone
+        val tripCache = mutableMapOf<String, com.nohimazin.tinytransit.data.db.entity.TripEntity?>()
+        val stopTimeCache = mutableMapOf<String, List<com.nohimazin.tinytransit.data.db.entity.StopTimeEntity>>()
+        val routeCache = mutableMapOf<String, com.nohimazin.tinytransit.data.db.entity.RouteEntity?>()
 
         for (entity in feedMessage.entityList) {
             if (!entity.hasTripUpdate()) continue
@@ -173,6 +197,12 @@ class GtfsRealtimeRepository(
 
             val routeId = tripDescriptor.routeId.takeIf { it.isNotEmpty() }
 
+            // TripUpdate の個別タイムスタンプ (便のリアルタイム進捗計測時刻)
+            val tripUpdateTimestamp = tripUpdate.timestamp.takeIf { it > 0 }
+
+            val trip = tripCache.getOrPut(tripId) { database.tripDao().get(feedId, tripId) }
+            val route = routeId?.let { rid -> routeCache.getOrPut(rid) { database.routeDao().get(feedId, rid) } }
+
             for (stu in tripUpdate.stopTimeUpdateList) {
                 val stopId = stu.stopId.takeIf { it.isNotEmpty() } ?: ""
                 val stopSequence = if (stu.hasStopSequence()) stu.stopSequence.toInt() else null
@@ -184,7 +214,16 @@ class GtfsRealtimeRepository(
                 val predictedArrival = arrivalEvent?.time?.takeIf { it > 0 }
                 val delay = arrivalEvent?.delay
 
-                val scheduledArrival = getStaticScheduledArrival(feedId, tripId, stopSequence, stopId)
+                val stopTimes = stopTimeCache.getOrPut(tripId) { database.stopTimeDao().getByTrip(feedId, tripId) }
+                val st = if (stopSequence != null) {
+                    stopTimes.firstOrNull { it.stopSequence == stopSequence }
+                } else {
+                    stopTimes.firstOrNull { it.stopId == stopId }
+                }
+                val scheduledArrival = st?.let { st2 ->
+                    val timeStr = st2.arrivalTime ?: st2.departureTime
+                    timeStr?.let { parseGtfsTimeToSeconds(it) }
+                }
 
                 predictions.add(
                     ArrivalPrediction(
@@ -199,6 +238,7 @@ class GtfsRealtimeRepository(
                         isSkipped = isSkipped,
                         isCanceled = isCanceled,
                         feedTimestamp = feedTimestamp,
+                        tripUpdateTimestamp = tripUpdateTimestamp,
                         agencyTimezone = agencyTimezone
                     )
                 )
@@ -261,9 +301,10 @@ class GtfsRealtimeRepository(
     suspend fun getArrivalsForStop(
         feedId: String,
         stopId: String,
-        url: String
+        url: String,
+        onProgress: (Long, Long) -> Unit = { _, _ -> }
     ): List<StopArrival> = withContext(Dispatchers.IO) {
-        val result = fetch(feedId, url)
+        val result = fetch(feedId, url, onProgress)
         val predictions = when (result) {
             is FetchResult.Success -> result.predictions
             else -> emptyList()
@@ -274,6 +315,11 @@ class GtfsRealtimeRepository(
             .map { it.stopId }.toSet()
         val effectiveIds = if (variantIds.isEmpty()) setOf(stopId) else variantIds
 
+        // 事前取得: 全 trips と routes をキャッシュ (DB クエリ削減)
+        val allTrips = database.tripDao().getAll(feedId)
+        val tripMap = allTrips.associateBy { it.tripId }
+        val routeMap = database.routeDao().getAll(feedId).associateBy { it.routeId }
+
         val nowEpoch = System.currentTimeMillis() / 1000
         predictions.filter { it.stopId in effectiveIds }
             // 過去の便を除外（予測到着時刻が現在より前のものは表示しない）
@@ -282,9 +328,9 @@ class GtfsRealtimeRepository(
                 pred >= nowEpoch - 60 // 1分前までは許容（更新タイミングのズレ対策）
             }
             .map { p ->
-                val trip = database.tripDao().get(feedId, p.tripId)
-                val route = trip?.let { database.routeDao().get(feedId, it.routeId) }
-                val stop = database.stopDao().get(feedId, p.stopId)
+                val trip = tripMap[p.tripId]
+                val route = trip?.let { routeMap[it.routeId] }
+                val stop = allStops.firstOrNull { it.stopId == p.stopId }
                 StopArrival(
                     prediction = p,
                     stopName = stop?.stopName,

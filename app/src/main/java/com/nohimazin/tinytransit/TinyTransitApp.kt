@@ -11,7 +11,7 @@ class TinyTransitApp : Application() {
             this,
             TinyTransitDatabase::class.java,
             "tinytransit.db"
-        ).build()
+        ).fallbackToDestructiveMigration().build()
     }
 
     val okHttpClient: OkHttpClient by lazy { OkHttpClient() }

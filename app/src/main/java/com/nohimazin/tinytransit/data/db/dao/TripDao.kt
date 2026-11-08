@@ -17,6 +17,9 @@ interface TripDao {
     @Query("SELECT * FROM trips WHERE feedId = :feedId AND routeId = :routeId")
     suspend fun getByRoute(feedId: String, routeId: String): List<TripEntity>
 
+    @Query("SELECT * FROM trips WHERE feedId = :feedId")
+    suspend fun getAll(feedId: String): List<TripEntity>
+
     @Query("DELETE FROM trips WHERE feedId = :feedId")
     suspend fun deleteByFeed(feedId: String)
 }

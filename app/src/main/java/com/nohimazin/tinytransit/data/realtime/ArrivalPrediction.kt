@@ -21,6 +21,7 @@ data class ArrivalPrediction(
     val isSkipped: Boolean,
     val isCanceled: Boolean,
     val feedTimestamp: Long?,
+    val tripUpdateTimestamp: Long? = null,
     val agencyTimezone: String? = null
 ) {
     /**

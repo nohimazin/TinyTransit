@@ -77,7 +77,7 @@ class GtfsRepository(
             try { db.execSQL("PRAGMA synchronous = OFF") } catch (e: Exception) { android.util.Log.w("GtfsImport", "synchronous pragma failed", e) }
             // ジャーナルを無効化してバルク削除・挿入を高速化（クラッシュ時は再インポートで復旧）
             db.beginTransaction()
-            android.util.Log.d("GtfsImport", "beginTransaction done")
+
             try {
                 // テーブルを DROP & CREATE して高速にクリア（DELETE は 55 万行で数十秒かかる）
                 val createTableSql = db.query("SELECT sql FROM sqlite_master WHERE type='table' AND name='stop_times'").use { c ->
@@ -91,18 +91,16 @@ class GtfsRepository(
                     db.execSQL("DROP TABLE IF EXISTS stop_times")
                     db.execSQL(createTableSql)
                     for (sql in indexSqls) db.execSQL(sql)
-                    android.util.Log.d("GtfsImport", "stop_times table recreated")
+
                 } else {
                     val deleted = db.delete("stop_times", "feedId = ?", arrayOf(feedId))
-                    android.util.Log.d("GtfsImport", "deleteByFeed done: deleted $deleted rows")
+
                 }
                 val sqlPrefix = "INSERT INTO stop_times (feedId,tripId,stopId,stopSequence,arrivalTime,departureTime,stopHeadsign,pickupType,dropOffType) VALUES "
                 val tuple = "(?,?,?,?,?,?,?,?,?)"
                 val batchRows = ArrayList<Array<Any?>>(100)
                 stopTimesFile.bufferedReader(Charsets.UTF_8).use { reader ->
-                    android.util.Log.d("GtfsImport", "reading header...")
                     val headerLine = reader.readLine() ?: return@use
-                    android.util.Log.d("GtfsImport", "header read: ${headerLine.take(80)}")
                     val header = GtfsCsvReader.parseLine(headerLine)
                     val idx = HashMap<String, Int>(header.size)
                     for (i in header.indices) idx[header[i]] = i
@@ -135,7 +133,6 @@ class GtfsRepository(
                         batchRows.clear()
                     }
 
-                    Log.d("GtfsImport", "Starting stop_times loop")
                     var line: String?
                     while (reader.readLine().also { line = it } != null) {
                         if (line!!.isEmpty()) continue
@@ -162,13 +159,11 @@ class GtfsRepository(
                         if (batchRows.size >= 100) {
                             flushBatch()
                             if (stopTimeCount % 100000 == 0) {
-                                Log.d("GtfsImport", "stop_times: $stopTimeCount rows")
                                 onProgress(0.35f + (stopTimeCount / 558816f) * 0.35f, "Loading stop_times... ($stopTimeCount)")
                             }
                         }
                     }
                     flushBatch()
-                    Log.d("GtfsImport", "stop_times loop done: $stopTimeCount rows, committing")
                 }
                 db.setTransactionSuccessful()
             } finally {
@@ -290,6 +285,22 @@ class GtfsRepository(
      * 停留所名で検索します。
      * アンダースコア後の数字だけが異なる停留所は統合して 1 件にまとめます。
      */
+    /**
+     * 監視対象停留所一覧を取得します。
+     */
+    suspend fun getMonitoredStops(feedId: String): List<com.nohimazin.tinytransit.data.db.entity.MonitoredStopEntity> =
+        withContext(Dispatchers.IO) {
+            database.monitoredStopDao().getAll(feedId)
+        }
+
+    /**
+     * 監視対象経路一覧を取得します。
+     */
+    suspend fun getMonitoredRoutes(feedId: String): List<com.nohimazin.tinytransit.data.db.entity.MonitoredRouteEntity> =
+        withContext(Dispatchers.IO) {
+            database.monitoredRouteDao().getAll(feedId)
+        }
+
     /**
      * 登録済み停留所数を取得します。
      */

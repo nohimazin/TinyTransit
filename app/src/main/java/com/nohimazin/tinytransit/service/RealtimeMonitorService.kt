@@ -154,11 +154,14 @@ class RealtimeMonitorService : Service() {
                 if (selTrip != null) {
                     filtered = filtered.filter { it.tripId == selTrip }
                 }
-                // フィードのタイムスタンプ (GTFS-RT が提供する更新時刻) を使用
-                val feedTimestamp = filtered.firstOrNull()?.feedTimestamp
+                // TripUpdate の個別タイムスタンプを優先 (便のリアルタイム進捗計測時刻)
+                // なければフィードレベルのタイムスタンプにフォールバック
+                val updateTimestamp = filtered.firstOrNull()?.tripUpdateTimestamp
+                    ?: filtered.firstOrNull()?.feedTimestamp
+                    ?: predictions.firstOrNull()?.tripUpdateTimestamp
                     ?: predictions.firstOrNull()?.feedTimestamp
-                val feedTimestampMs = feedTimestamp?.let { it * 1000 }
-                updateNotification(currentStopName, filtered, feedTimestampMs)
+                val updateTimestampMs = updateTimestamp?.let { it * 1000 }
+                updateNotification(currentStopName, filtered, updateTimestampMs)
             }
         }
     }
@@ -234,7 +237,7 @@ class RealtimeMonitorService : Service() {
         val title = buildNotificationTitle(stopName, predictions, lastUpdateEpoch)
         val content = buildNotificationContent(stopName, predictions, lastUpdateEpoch)
 
-        return NotificationCompat.Builder(this, CHANNEL_ID)
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle(title)
             .setContentText(content)
             .setStyle(NotificationCompat.BigTextStyle().bigText(content))
@@ -244,7 +247,14 @@ class RealtimeMonitorService : Service() {
             .setContentIntent(openPending)
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止", stopPending)
             .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
+
+        // GTFS-RT の更新時刻を基準にカウントアップするクロノメーター
+        if (lastUpdateEpoch != null && lastUpdateEpoch > 0) {
+            builder.setWhen(lastUpdateEpoch)
+            builder.setUsesChronometer(true)
+        }
+
+        return builder.build()
     }
 
     private fun buildNotificationTitle(
@@ -257,11 +267,18 @@ class RealtimeMonitorService : Service() {
         val mins = nearest.minutesUntil(System.currentTimeMillis() / 1000)
         val minsText = if (mins != null) "あと${mins}分" else "到着済み"
         val delay = nearest.delayText()
-        val ago = if (lastUpdateEpoch != null && lastUpdateEpoch > 0) {
-            val sec = (System.currentTimeMillis() - lastUpdateEpoch) / 1000
-            "${sec}秒前取得"
+        // TripUpdate のタイムスタンプを HH:MM:SS で表示
+        val tripTimestamp = nearest.tripUpdateTimestamp ?: (lastUpdateEpoch?.let { it / 1000 })
+        val timeText = if (tripTimestamp != null && tripTimestamp > 0) {
+            val sdf = java.text.SimpleDateFormat("HH:mm:ss", java.util.Locale.getDefault())
+            sdf.timeZone = java.util.TimeZone.getTimeZone("Asia/Tokyo")
+            sdf.format(java.util.Date(tripTimestamp * 1000))
         } else ""
-        return "$minsText・$delay・$ago".trim('・', ' ')
+        return if (timeText.isNotEmpty()) {
+            "$minsText・$delay・${timeText}時点"
+        } else {
+            "$minsText・$delay"
+        }
     }
 
     private fun buildNotificationContent(
@@ -290,7 +307,11 @@ class RealtimeMonitorService : Service() {
                 val delay = nearest.delayText()
                 val mins = nearest.minutesUntil(System.currentTimeMillis() / 1000)
                 val minsText = if (mins != null) "あと${mins}分" else ""
-                sb.append("$routeName - $time ($delay) $minsText")
+                sb.append("$routeName - $time")
+                sb.append("\n遅延: $delay")
+                if (minsText.isNotEmpty()) {
+                    sb.append("  $minsText")
+                }
             }
         }
         if (lastUpdateEpoch != null && lastUpdateEpoch > 0) {
