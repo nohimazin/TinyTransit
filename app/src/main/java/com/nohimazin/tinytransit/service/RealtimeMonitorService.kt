@@ -33,9 +33,11 @@ class RealtimeMonitorService : Service() {
         const val NOTIFICATION_ID = 1001
         const val CHANNEL_ID = "realtime_monitor"
         const val ACTION_STOP = "com.nohimazin.tinytransit.ACTION_STOP_MONITOR"
+        const val ACTION_UPDATE_SELECTION = "com.nohimazin.tinytransit.ACTION_UPDATE_SELECTION"
         const val EXTRA_FEED_ID = "feed_id"
         const val EXTRA_STOP_ID = "stop_id"
         const val EXTRA_STOP_NAME = "stop_name"
+        const val EXTRA_SELECTED_TRIP_ID = "selected_trip_id"
 
         @Volatile
         var isRunning: Boolean = false
@@ -47,6 +49,10 @@ class RealtimeMonitorService : Service() {
 
         @Volatile
         var currentStopName: String? = null
+            private set
+
+        @Volatile
+        var currentSelectedTripId: String? = null
             private set
     }
 
@@ -65,30 +71,59 @@ class RealtimeMonitorService : Service() {
             return START_NOT_STICKY
         }
 
+        if (intent?.action == ACTION_UPDATE_SELECTION) {
+            val newTripId = intent.getStringExtra(EXTRA_SELECTED_TRIP_ID)
+            currentSelectedTripId = newTripId
+            controller?.let { ctrl ->
+                serviceScope.launch {
+                    val predictions = ctrl.latestPredictions.value
+                    val stopId = currentStopId
+                    val nowEpoch = System.currentTimeMillis() / 1000
+                    var filtered = if (stopId != null) {
+                        val baseId = GtfsRepository.baseStopId(stopId)
+                        predictions.filter { GtfsRepository.baseStopId(it.stopId) == baseId }
+                    } else {
+                        predictions
+                    }
+                    filtered = filtered.filter { p ->
+                        val pred = p.predictedArrivalEpoch ?: return@filter true
+                        pred >= nowEpoch - 60
+                    }
+                    if (newTripId != null) {
+                        filtered = filtered.filter { it.tripId == newTripId }
+                    }
+                    updateNotification(currentStopName, filtered, ctrl.lastUpdateEpoch.value)
+                }
+            }
+            return START_STICKY
+        }
+
         val feedId = intent?.getStringExtra(EXTRA_FEED_ID) ?: GtfsRepository.DEFAULT_FEED_ID
         val stopId = intent?.getStringExtra(EXTRA_STOP_ID)
         val stopName = intent?.getStringExtra(EXTRA_STOP_NAME)
+        val selectedTripId = intent?.getStringExtra(EXTRA_SELECTED_TRIP_ID)
 
         currentStopId = stopId
         currentStopName = stopName
+        currentSelectedTripId = selectedTripId
 
         // 速やかに startForeground を実行
         val notification = buildNotification(stopName, emptyList(), null)
         startForeground(NOTIFICATION_ID, notification)
 
         // 監視開始
-        startMonitoring(feedId, stopId)
+        startMonitoring(feedId, stopId, selectedTripId)
 
         isRunning = true
         return START_STICKY
     }
 
-    private fun startMonitoring(feedId: String, stopId: String?) {
+    private fun startMonitoring(feedId: String, stopId: String?, selectedTripId: String?) {
         val app = application as TinyTransitApp
         controller = RealtimeUpdateController(
             context = this,
             database = app.database,
-            httpClient = app.okHttpClient,
+            httpClient = app.realtimeHttpClient,
             scope = serviceScope
         ).apply {
             configure(
@@ -102,11 +137,22 @@ class RealtimeMonitorService : Service() {
         // 予測更新を監視して通知を更新
         serviceScope.launch {
             controller?.latestPredictions?.collectLatest { predictions ->
-                val filtered = if (stopId != null) {
+                val nowEpoch = System.currentTimeMillis() / 1000
+                var filtered = if (stopId != null) {
                     val baseId = GtfsRepository.baseStopId(stopId)
                     predictions.filter { GtfsRepository.baseStopId(it.stopId) == baseId }
                 } else {
                     predictions
+                }
+                // 過去の便を除外
+                filtered = filtered.filter { p ->
+                    val pred = p.predictedArrivalEpoch ?: return@filter true
+                    pred >= nowEpoch - 60
+                }
+                // 選択された便がある場合はそれのみ表示
+                val selTrip = currentSelectedTripId
+                if (selTrip != null) {
+                    filtered = filtered.filter { it.tripId == selTrip }
                 }
                 updateNotification(currentStopName, filtered, controller?.lastUpdateEpoch?.value)
             }

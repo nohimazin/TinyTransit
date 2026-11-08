@@ -1,6 +1,7 @@
 package com.nohimazin.tinytransit.data.realtime
 
 import android.content.Context
+import android.content.SharedPreferences
 import android.net.ConnectivityManager
 import android.net.Network
 import android.net.NetworkCapabilities
@@ -18,15 +19,16 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import okhttp3.OkHttpClient
-import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.TimeUnit
 
 /**
  * 定期取得の制御を行うコントローラー。
- * - 取得間隔の管理
- * - 重複リクエスト防止
- * - 通信失敗時も通常周期で再取得
- * - ネットワーク監視
- * - 通信量・更新時刻の記録
+ * - 取得間隔の管理 (SharedPreferences で永続化)
+ * - 重複リクエスト防止 (Single-flight は Repository 側)
+ * - ネットワーク監視 (種別 + 検証状態)
+ * - 通信失敗時も通常周期で再取得 (指数バックオフなし)
+ * - Retry-After の尊重 (429/503)
+ * - 通信量の実測
  */
 class RealtimeUpdateController(
     private val context: Context,
@@ -36,15 +38,25 @@ class RealtimeUpdateController(
 ) {
     companion object {
         private const val TAG = "RealtimeCtrl"
-        const val DEFAULT_INTERVAL_MS = 15_000L
+        private const val PREFS_NAME = "realtime_settings"
+        private const val KEY_INTERVAL_MS = "interval_ms"
+
         const val INTERVAL_HIGH = 15_000L
         const val INTERVAL_NORMAL = 30_000L
         const val INTERVAL_SAVE = 60_000L
+        val INTERVAL_OPTIONS = listOf(INTERVAL_HIGH, INTERVAL_NORMAL, INTERVAL_SAVE)
     }
 
-    // 設定
+    private val prefs: SharedPreferences =
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+
+    // 設定 (SharedPreferences から復元)
     @Volatile
-    var intervalMs: Long = DEFAULT_INTERVAL_MS
+    var intervalMs: Long = prefs.getLong(KEY_INTERVAL_MS, INTERVAL_HIGH)
+        set(value) {
+            field = value
+            prefs.edit().putLong(KEY_INTERVAL_MS, value).apply()
+        }
 
     // 状態
     private val _isRunning = MutableStateFlow(false)
@@ -56,28 +68,34 @@ class RealtimeUpdateController(
     private val _lastError = MutableStateFlow<String?>(null)
     val lastError: StateFlow<String?> = _lastError
 
+    private val _lastErrorType = MutableStateFlow(FetchErrorType.NONE)
+    val lastErrorType: StateFlow<FetchErrorType> = _lastErrorType
+
     private val _totalBytes = MutableStateFlow(0L)
     val totalBytes: StateFlow<Long> = _totalBytes
 
     private val _lastDurationMs = MutableStateFlow(0L)
     val lastDurationMs: StateFlow<Long> = _lastDurationMs
 
+    private val _networkState = MutableStateFlow(NetworkState(NetworkType.OFFLINE, false))
+    val networkState: StateFlow<NetworkState> = _networkState
+
+    private val _latestPredictions = MutableStateFlow<List<ArrivalPrediction>>(emptyList())
+    val latestPredictions: StateFlow<List<ArrivalPrediction>> = _latestPredictions
+
     // 内部状態
     private var monitorJob: Job? = null
-    private val isFetching = AtomicBoolean(false)
     private var feedId: String = GtfsRepository.DEFAULT_FEED_ID
     private var stopId: String? = null
     private var tripUpdateUrl: String = "https://km.bus-vision.jp/realtime/sankobus_trip_update.bin"
 
-    // 最新の到着予測
-    private val _latestPredictions = MutableStateFlow<List<ArrivalPrediction>>(emptyList())
-    val latestPredictions: StateFlow<List<ArrivalPrediction>> = _latestPredictions
+    // Retry-After 期限 (elapsedRealtime ベース)
+    @Volatile
+    private var retryAfterDeadline: Long = 0L
 
     // ネットワーク監視
     private var connectivityManager: ConnectivityManager? = null
     private var networkCallback: ConnectivityManager.NetworkCallback? = null
-    @Volatile
-    private var isNetworkAvailable = true
 
     private val repository by lazy {
         GtfsRealtimeRepository(context, database, httpClient)
@@ -93,6 +111,7 @@ class RealtimeUpdateController(
         if (_isRunning.value) return
         _isRunning.value = true
         _lastError.value = null
+        _lastErrorType.value = FetchErrorType.NONE
         startNetworkMonitoring()
         monitorJob = scope.launch {
             runLoop()
@@ -109,38 +128,64 @@ class RealtimeUpdateController(
     private suspend fun runLoop() {
         while (scope.isActive && _isRunning.value) {
             // ネットワークが利用不可の場合は待機
-            if (!isNetworkAvailable) {
+            val netState = _networkState.value
+            if (!netState.isValidated) {
                 delay(5000)
                 continue
             }
 
-            // 前回のリクエストが完了するまで待機（重複防止）
-            if (isFetching.get()) {
-                delay(500)
-                continue
-            }
-
             val startTime = SystemClock.elapsedRealtime()
-            isFetching.set(true)
             try {
-                val predictions = repository.fetchAndDecodeTripUpdates(feedId, tripUpdateUrl)
-                _latestPredictions.value = predictions
-                _lastUpdateEpoch.value = System.currentTimeMillis()
-                _lastError.value = null
-                _totalBytes.value += 0 // placeholder; actual bytes tracked in repository
+                val result = repository.fetch(feedId, tripUpdateUrl)
+                when (result) {
+                    is FetchResult.Success -> {
+                        _latestPredictions.value = result.predictions
+                        _lastUpdateEpoch.value = System.currentTimeMillis()
+                        _lastError.value = null
+                        _lastErrorType.value = FetchErrorType.NONE
+                        _totalBytes.value += result.receivedBytes
+                    }
+                    is FetchResult.HttpError -> {
+                        _lastError.value = "HTTP ${result.statusCode}"
+                        _lastErrorType.value = FetchErrorType.HTTP_ERROR
+                        _totalBytes.value += result.receivedBytes
+                        // Retry-After の処理
+                        result.retryAfterMs?.let { ms ->
+                            val deadline = SystemClock.elapsedRealtime() + ms
+                            if (deadline > retryAfterDeadline) {
+                                retryAfterDeadline = deadline
+                            }
+                        }
+                    }
+                    is FetchResult.NetworkError -> {
+                        _lastError.value = result.exception.message
+                        _lastErrorType.value = FetchErrorType.NETWORK_ERROR
+                    }
+                    is FetchResult.Timeout -> {
+                        _lastError.value = "Timeout"
+                        _lastErrorType.value = FetchErrorType.TIMEOUT
+                    }
+                    is FetchResult.DecodeError -> {
+                        _lastError.value = "Decode error: ${result.exception.message}"
+                        _lastErrorType.value = FetchErrorType.DECODE_ERROR
+                        _totalBytes.value += result.receivedBytes
+                    }
+                }
             } catch (e: Exception) {
-                Log.w(TAG, "Fetch failed: ${e.message}")
+                Log.w(TAG, "Unexpected: ${e.message}")
                 _lastError.value = e.message
+                _lastErrorType.value = FetchErrorType.NETWORK_ERROR
             } finally {
-                isFetching.set(false)
                 val duration = SystemClock.elapsedRealtime() - startTime
                 _lastDurationMs.value = duration
             }
 
             // 次の取得タイミングを計算
-            // 開始時刻基準で intervalMs 待つ。取得に時間がかかった場合は自然に延長。
+            // 通常周期と Retry-After のうち、遅い方を採用
             val elapsed = SystemClock.elapsedRealtime() - startTime
-            val waitTime = (intervalMs - elapsed).coerceAtLeast(0)
+            val normalWait = (intervalMs - elapsed).coerceAtLeast(0)
+            val retryWait = (retryAfterDeadline - SystemClock.elapsedRealtime()).coerceAtLeast(0)
+            val waitTime = maxOf(normalWait, retryWait)
             if (waitTime > 0) {
                 delay(waitTime)
             }
@@ -151,20 +196,19 @@ class RealtimeUpdateController(
         connectivityManager = context.getSystemService(Context.CONNECTIVITY_SERVICE) as ConnectivityManager
         val callback = object : ConnectivityManager.NetworkCallback() {
             override fun onAvailable(network: Network) {
-                val caps = connectivityManager?.getNetworkCapabilities(network)
-                isNetworkAvailable = caps?.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET) == true
-                if (isNetworkAvailable) {
-                    Log.d(TAG, "Network available")
-                }
+                updateNetworkState(network)
             }
 
             override fun onLost(network: Network) {
-                isNetworkAvailable = false
-                Log.d(TAG, "Network lost")
+                // デフォルトネットワークが失われた場合のみオフライン
+                val defaultNetwork = connectivityManager?.activeNetwork
+                if (defaultNetwork == null || defaultNetwork == network) {
+                    _networkState.value = NetworkState(NetworkType.OFFLINE, false)
+                }
             }
 
             override fun onCapabilitiesChanged(network: Network, caps: NetworkCapabilities) {
-                isNetworkAvailable = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+                updateNetworkState(network)
             }
         }
         networkCallback = callback
@@ -178,9 +222,44 @@ class RealtimeUpdateController(
                     .build()
                 connectivityManager?.registerNetworkCallback(request, callback)
             }
+            // 初期状態を設定
+            updateCurrentNetworkState()
         } catch (e: Exception) {
             Log.w(TAG, "Failed to register network callback: ${e.message}")
         }
+    }
+
+    private fun updateCurrentNetworkState() {
+        val cm = connectivityManager ?: return
+        val network = cm.activeNetwork
+        if (network == null) {
+            _networkState.value = NetworkState(NetworkType.OFFLINE, false)
+            return
+        }
+        updateNetworkState(network)
+    }
+
+    private fun updateNetworkState(network: Network) {
+        val cm = connectivityManager ?: return
+        val caps = cm.getNetworkCapabilities(network) ?: return
+        // デフォルトネットワークか確認 (API 23 対応)
+        val defaultNetwork = cm.activeNetwork
+        if (defaultNetwork != null && defaultNetwork != network && Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            // API 23: registerNetworkCallback はすべてのネットワークを通知するため、
+            // デフォルトネットワーク以外は無視
+            return
+        }
+
+        val type = when {
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) -> NetworkType.WIFI
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_CELLULAR) -> NetworkType.MOBILE
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_ETHERNET) -> NetworkType.ETHERNET
+            caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN) -> NetworkType.VPN
+            else -> NetworkType.OTHER
+        }
+        val validated = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        val hasInternet = caps.hasCapability(NetworkCapabilities.NET_CAPABILITY_INTERNET)
+        _networkState.value = NetworkState(type, validated && hasInternet)
     }
 
     private fun stopNetworkMonitoring() {
@@ -195,3 +274,12 @@ class RealtimeUpdateController(
         connectivityManager = null
     }
 }
+
+enum class NetworkType {
+    WIFI, MOBILE, ETHERNET, VPN, OTHER, OFFLINE
+}
+
+data class NetworkState(
+    val type: NetworkType,
+    val isValidated: Boolean
+)

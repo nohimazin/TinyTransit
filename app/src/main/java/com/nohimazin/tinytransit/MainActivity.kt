@@ -24,7 +24,6 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
-import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -47,7 +46,7 @@ import com.nohimazin.tinytransit.ui.theme.TinyTransitTheme
 class MainActivity : ComponentActivity() {
     private val notificationPermissionLauncher = registerForActivityResult(
         ActivityResultContracts.RequestPermission()
-    ) { /* result handled in UI */ }
+    ) { }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -59,7 +58,7 @@ class MainActivity : ComponentActivity() {
                     MainScreen(
                         activity = this,
                         gtfsRepository = app.gtfsRepository,
-                        realtimeRepository = GtfsRealtimeRepository(app, app.database, app.okHttpClient),
+                        realtimeRepository = GtfsRealtimeRepository(app, app.database, app.realtimeHttpClient),
                         modifier = Modifier.padding(innerPadding)
                     )
                 }
@@ -101,22 +100,17 @@ fun MainScreen(
     var routesForStop by remember { mutableStateOf<List<com.nohimazin.tinytransit.data.db.entity.RouteEntity>>(emptyList()) }
     var selectedRouteId by remember { mutableStateOf<String?>(null) }
     var routeSearchQuery by remember { mutableStateOf("") }
+    var routeFilterExpanded by remember { mutableStateOf(false) }
 
     var allArrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
     var arrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
     var arrivalStatus by remember { mutableStateOf("") }
     var arrivalRunning by remember { mutableStateOf(false) }
     var fetchTrigger by remember { mutableStateOf(0) }
+    var selectedTripId by remember { mutableStateOf<String?>(null) }
 
     var monitoring by remember { mutableStateOf(RealtimeMonitorService.isRunning) }
-
-    // 通知から停止された場合もリアルタイムに反映するため、定期的に状態を同期
-    LaunchedEffect(Unit) {
-        while (true) {
-            monitoring = RealtimeMonitorService.isRunning
-            kotlinx.coroutines.delay(500)
-        }
-    }
+    var networkStateText by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
         importRunning = true
@@ -138,6 +132,11 @@ fun MainScreen(
     }
 
     LaunchedEffect(searchQuery) {
+        // 選択された停留所の名前と一致する場合は検索しない（二重検索防止）
+        if (selectedStop != null && searchQuery == selectedStop!!.stopName) {
+            searchResults = emptyList()
+            return@LaunchedEffect
+        }
         if (searchQuery.length >= 2) {
             searchResults = gtfsRepository.searchStops(GtfsRepository.DEFAULT_FEED_ID, searchQuery)
         } else {
@@ -177,6 +176,37 @@ fun MainScreen(
             arrivalStatus = "エラー: ${e.message}"
         } finally {
             arrivalRunning = false
+        }
+    }
+
+    // 選択された便が変更されたら、監視中に通知を更新
+    LaunchedEffect(selectedTripId) {
+        if (monitoring) {
+            val intent = Intent(context, RealtimeMonitorService::class.java).apply {
+                action = RealtimeMonitorService.ACTION_UPDATE_SELECTION
+                if (selectedTripId != null) {
+                    putExtra(RealtimeMonitorService.EXTRA_SELECTED_TRIP_ID, selectedTripId)
+                }
+            }
+            context.startService(intent)
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        while (true) {
+            monitoring = RealtimeMonitorService.isRunning
+            val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
+            val network = cm.activeNetwork
+            val caps = network?.let { cm.getNetworkCapabilities(it) }
+            networkStateText = when {
+                caps == null -> "オフライン"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_WIFI) -> "Wi-Fi"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_CELLULAR) -> "モバイル"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_ETHERNET) -> "Ethernet"
+                caps.hasTransport(android.net.NetworkCapabilities.TRANSPORT_VPN) -> "VPN"
+                else -> "その他"
+            }
+            kotlinx.coroutines.delay(2000)
         }
     }
 
@@ -231,49 +261,59 @@ fun MainScreen(
                 Text(text = "選択: ${stop.stopName}", modifier = Modifier.padding(top = 8.dp))
             }
 
-            // Route filter chips
+            // Route filter (collapsible)
             if (routesForStop.size > 1) {
                 item {
-                    OutlinedTextField(
-                        value = routeSearchQuery,
-                        onValueChange = { routeSearchQuery = it },
-                        label = { Text("路線名で絞り込み") },
+                    Button(
+                        onClick = { routeFilterExpanded = !routeFilterExpanded },
                         modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                    )
-                }
-                item {
-                    val filteredRoutes = if (routeSearchQuery.isBlank()) {
-                        routesForStop
-                    } else {
-                        routesForStop.filter { r ->
-                            (r.routeLongName ?: "").contains(routeSearchQuery, ignoreCase = true) ||
-                                (r.routeShortName ?: "").contains(routeSearchQuery, ignoreCase = true)
-                        }
-                    }
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(4.dp),
-                        verticalArrangement = Arrangement.spacedBy(4.dp),
-                        modifier = Modifier.fillMaxWidth()
                     ) {
-                        FilterChip(
-                            selected = selectedRouteId == null,
-                            onClick = {
-                                selectedRouteId = null
-                                arrivals = allArrivals
-                                arrivalStatus = "到着予測: ${arrivals.size} 件"
-                            },
-                            label = { Text("全て") }
+                        Text(if (routeFilterExpanded) "路線フィルターを閉じる" else "路線フィルターを開く")
+                    }
+                }
+                if (routeFilterExpanded) {
+                    item {
+                        OutlinedTextField(
+                            value = routeSearchQuery,
+                            onValueChange = { routeSearchQuery = it },
+                            label = { Text("路線名で絞り込み") },
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
                         )
-                        filteredRoutes.forEach { route ->
+                    }
+                    item {
+                        val filteredRoutes = if (routeSearchQuery.isBlank()) {
+                            routesForStop
+                        } else {
+                            routesForStop.filter { r ->
+                                (r.routeLongName ?: "").contains(routeSearchQuery, ignoreCase = true) ||
+                                    (r.routeShortName ?: "").contains(routeSearchQuery, ignoreCase = true)
+                            }
+                        }
+                        FlowRow(
+                            horizontalArrangement = Arrangement.spacedBy(4.dp),
+                            verticalArrangement = Arrangement.spacedBy(4.dp),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
                             FilterChip(
-                                selected = selectedRouteId == route.routeId,
+                                selected = selectedRouteId == null,
                                 onClick = {
-                                    selectedRouteId = route.routeId
-                                    arrivals = allArrivals.filter { it.prediction.routeId == route.routeId }
+                                    selectedRouteId = null
+                                    arrivals = allArrivals
                                     arrivalStatus = "到着予測: ${arrivals.size} 件"
                                 },
-                                label = { Text(route.routeLongName ?: route.routeShortName ?: route.routeId) }
+                                label = { Text("全て") }
                             )
+                            filteredRoutes.forEach { route ->
+                                FilterChip(
+                                    selected = selectedRouteId == route.routeId,
+                                    onClick = {
+                                        selectedRouteId = route.routeId
+                                        arrivals = allArrivals.filter { it.prediction.routeId == route.routeId }
+                                        arrivalStatus = "到着予測: ${arrivals.size} 件"
+                                    },
+                                    label = { Text(route.routeLongName ?: route.routeShortName ?: route.routeId) }
+                                )
+                            }
                         }
                     }
                 }
@@ -309,6 +349,9 @@ fun MainScreen(
                                     putExtra(RealtimeMonitorService.EXTRA_FEED_ID, GtfsRepository.DEFAULT_FEED_ID)
                                     putExtra(RealtimeMonitorService.EXTRA_STOP_ID, stop.stopId)
                                     putExtra(RealtimeMonitorService.EXTRA_STOP_NAME, stop.stopName)
+                                    if (selectedTripId != null) {
+                                        putExtra(RealtimeMonitorService.EXTRA_SELECTED_TRIP_ID, selectedTripId)
+                                    }
                                 }
                                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
                                     context.startForegroundService(intent)
@@ -338,10 +381,32 @@ fun MainScreen(
                 }
             }
 
+            // Network state
+            item {
+                Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))
+            }
+
             // Arrivals
             items(arrivals) { a ->
+                val isSelected = selectedTripId == a.prediction.tripId
                 Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    Text(text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}")
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Text(
+                            text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}",
+                            modifier = Modifier.weight(1f)
+                        )
+                        Button(
+                            onClick = {
+                                selectedTripId = if (isSelected) null else a.prediction.tripId
+                            },
+                            modifier = Modifier.padding(start = 8.dp)
+                        ) {
+                            Text(if (isSelected) "選択中" else "選択")
+                        }
+                    }
                     Text(text = "停留所: ${a.stopName ?: GtfsRepository.baseStopId(a.prediction.stopId)}")
                     Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
                     val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
@@ -354,7 +419,7 @@ fun MainScreen(
     }
 }
 
-private fun formatSeconds(seconds: Long?): String {
+fun formatSeconds(seconds: Long?): String {
     if (seconds == null) return "--:--"
     val h = (seconds / 3600) % 24
     val m = (seconds % 3600) / 60
