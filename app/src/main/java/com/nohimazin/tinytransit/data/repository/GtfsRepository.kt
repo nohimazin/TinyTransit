@@ -290,6 +290,13 @@ class GtfsRepository(
      * 停留所名で検索します。
      * アンダースコア後の数字だけが異なる停留所は統合して 1 件にまとめます。
      */
+    /**
+     * 登録済み停留所数を取得します。
+     */
+    suspend fun getStopCount(feedId: String): Int = withContext(Dispatchers.IO) {
+        database.stopDao().count(feedId)
+    }
+
     suspend fun searchStops(feedId: String, query: String): List<com.nohimazin.tinytransit.data.db.entity.StopEntity> =
         withContext(Dispatchers.IO) {
             if (query.isBlank()) return@withContext emptyList()
@@ -309,6 +316,34 @@ class GtfsRepository(
         withContext(Dispatchers.IO) {
             database.stopDao().getAll(feedId).filter { GtfsRepository.baseStopId(it.stopId) == baseStopId }
         }
+
+    /**
+     * 乗車停留所と降車停留所を経由する便を検索します。
+     * 両方の停留所を通過する便の trip_id を返します。
+     */
+    suspend fun findTripsBetweenStops(
+        feedId: String,
+        originStopId: String,
+        destinationStopId: String
+    ): List<String> = withContext(Dispatchers.IO) {
+        val originBase = baseStopId(originStopId)
+        val destBase = baseStopId(destinationStopId)
+        val originVariants = getStopVariants(feedId, originBase).map { it.stopId }.toSet()
+        val destVariants = getStopVariants(feedId, destBase).map { it.stopId }.toSet()
+
+        // 乗車停留所の stop_times から trip_id を取得
+        val originTrips = originVariants.flatMap { v ->
+            database.stopTimeDao().getByStop(feedId, v)
+        }.map { it.tripId }.distinct()
+
+        // 降車停留所の stop_times から trip_id を取得
+        val destTrips = destVariants.flatMap { v ->
+            database.stopTimeDao().getByStop(feedId, v)
+        }.map { it.tripId }.toSet()
+
+        // 両方を経由する便
+        originTrips.filter { it in destTrips }
+    }
 
     /**
      * 指定された停留所に乗り入れる路線一覧を取得します。

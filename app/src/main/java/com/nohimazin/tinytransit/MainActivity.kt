@@ -11,7 +11,6 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
-import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -20,7 +19,6 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.material3.Button
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
@@ -92,27 +90,57 @@ fun MainScreen(
     var importStatus by remember { mutableStateOf("初期化中...") }
     var importProgress by remember { mutableStateOf(0f) }
     var importRunning by remember { mutableStateOf(true) }
+    var updateTrigger by remember { mutableStateOf(0) }
 
-    var searchQuery by remember { mutableStateOf("") }
-    var searchResults by remember { mutableStateOf<List<StopEntity>>(emptyList()) }
-    var selectedStop by remember { mutableStateOf<StopEntity?>(null) }
+    // 乗車停留所
+    var originSearchQuery by remember { mutableStateOf("") }
+    var originSearchResults by remember { mutableStateOf<List<StopEntity>>(emptyList()) }
+    var originStop by remember { mutableStateOf<StopEntity?>(null) }
 
-    var routesForStop by remember { mutableStateOf<List<com.nohimazin.tinytransit.data.db.entity.RouteEntity>>(emptyList()) }
-    var selectedRouteId by remember { mutableStateOf<String?>(null) }
-    var routeSearchQuery by remember { mutableStateOf("") }
-    var routeFilterExpanded by remember { mutableStateOf(false) }
+    // 降車停留所
+    var destSearchQuery by remember { mutableStateOf("") }
+    var destSearchResults by remember { mutableStateOf<List<StopEntity>>(emptyList()) }
+    var destStop by remember { mutableStateOf<StopEntity?>(null) }
 
-    var allArrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
+    // 到着予測
     var arrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
     var arrivalStatus by remember { mutableStateOf("") }
     var arrivalRunning by remember { mutableStateOf(false) }
     var fetchTrigger by remember { mutableStateOf(0) }
     var selectedTripId by remember { mutableStateOf<String?>(null) }
 
+    // バックグラウンド監視
     var monitoring by remember { mutableStateOf(RealtimeMonitorService.isRunning) }
     var networkStateText by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
+        importRunning = true
+        try {
+            // 既にデータが存在する場合はインポートをスキップ
+            val existingCount = gtfsRepository.getStopCount(GtfsRepository.DEFAULT_FEED_ID)
+            if (existingCount > 0) {
+                importStatus = "インポート済み (${existingCount} 停留所)"
+                importProgress = 1f
+            } else {
+                gtfsRepository.importStaticGtfs(
+                    feedId = GtfsRepository.DEFAULT_FEED_ID,
+                    url = "https://km.bus-vision.jp/gtfs/sankobus/gtfsFeed",
+                    onProgress = { p, msg ->
+                        importProgress = p
+                        importStatus = msg
+                    }
+                )
+                importStatus = "インポート完了"
+            }
+        } catch (e: Exception) {
+            importStatus = "エラー: ${e.message}"
+        } finally {
+            importRunning = false
+        }
+    }
+
+    LaunchedEffect(updateTrigger) {
+        if (updateTrigger == 0) return@LaunchedEffect
         importRunning = true
         try {
             gtfsRepository.importStaticGtfs(
@@ -123,7 +151,7 @@ fun MainScreen(
                     importStatus = msg
                 }
             )
-            importStatus = "インポート完了"
+            importStatus = "更新完了"
         } catch (e: Exception) {
             importStatus = "エラー: ${e.message}"
         } finally {
@@ -131,30 +159,35 @@ fun MainScreen(
         }
     }
 
-    LaunchedEffect(searchQuery) {
-        // 選択された停留所の名前と一致する場合は検索しない（二重検索防止）
-        if (selectedStop != null && searchQuery == selectedStop!!.stopName) {
-            searchResults = emptyList()
+    LaunchedEffect(originSearchQuery) {
+        if (originStop != null && originSearchQuery == originStop!!.stopName) {
+            originSearchResults = emptyList()
             return@LaunchedEffect
         }
-        if (searchQuery.length >= 2) {
-            searchResults = gtfsRepository.searchStops(GtfsRepository.DEFAULT_FEED_ID, searchQuery)
+        if (originSearchQuery.length >= 2) {
+            originSearchResults = gtfsRepository.searchStops(GtfsRepository.DEFAULT_FEED_ID, originSearchQuery)
         } else {
-            searchResults = emptyList()
+            originSearchResults = emptyList()
         }
     }
 
-    LaunchedEffect(selectedStop) {
-        val stop = selectedStop ?: return@LaunchedEffect
-        routesForStop = gtfsRepository.getRoutesForStop(GtfsRepository.DEFAULT_FEED_ID, stop.stopId)
-        selectedRouteId = null
+    LaunchedEffect(destSearchQuery) {
+        if (destStop != null && destSearchQuery == destStop!!.stopName) {
+            destSearchResults = emptyList()
+            return@LaunchedEffect
+        }
+        if (destSearchQuery.length >= 2) {
+            destSearchResults = gtfsRepository.searchStops(GtfsRepository.DEFAULT_FEED_ID, destSearchQuery)
+        } else {
+            destSearchResults = emptyList()
+        }
     }
 
     LaunchedEffect(fetchTrigger) {
         if (fetchTrigger == 0) return@LaunchedEffect
-        val stop = selectedStop
-        if (stop == null) {
-            arrivalStatus = "停留所を選択してください"
+        val origin = originStop
+        if (origin == null) {
+            arrivalStatus = "乗車停留所を選択してください"
             return@LaunchedEffect
         }
         arrivalRunning = true
@@ -162,16 +195,21 @@ fun MainScreen(
         try {
             val result = realtimeRepository.getArrivalsForStop(
                 feedId = GtfsRepository.DEFAULT_FEED_ID,
-                stopId = stop.stopId,
+                stopId = origin.stopId,
                 url = "https://km.bus-vision.jp/realtime/sankobus_trip_update.bin"
             )
-            allArrivals = result
-            arrivals = if (selectedRouteId != null) {
-                result.filter { it.prediction.routeId == selectedRouteId }
+            val filtered = if (destStop != null) {
+                val commonTrips = gtfsRepository.findTripsBetweenStops(
+                    GtfsRepository.DEFAULT_FEED_ID,
+                    origin.stopId,
+                    destStop!!.stopId
+                ).toSet()
+                result.filter { it.prediction.tripId in commonTrips }
             } else {
                 result
             }
-            arrivalStatus = "到着予測: ${arrivals.size} 件"
+            arrivals = filtered
+            arrivalStatus = "到着予測: ${arrivals.size} 件" + if (destStop != null) " (${destStop!!.stopName} 行き)" else ""
         } catch (e: Exception) {
             arrivalStatus = "エラー: ${e.message}"
         } finally {
@@ -179,7 +217,6 @@ fun MainScreen(
         }
     }
 
-    // 選択された便が変更されたら、監視中に通知を更新
     LaunchedEffect(selectedTripId) {
         if (monitoring) {
             val intent = Intent(context, RealtimeMonitorService::class.java).apply {
@@ -223,28 +260,33 @@ fun MainScreen(
                 }
             } else {
                 Text(text = importStatus)
+                Button(
+                    onClick = { updateTrigger++ },
+                    enabled = !importRunning,
+                    modifier = Modifier.padding(top = 4.dp)
+                ) {
+                    Text("GTFS を更新")
+                }
             }
         }
 
-        // Stop search
+        // 乗車停留所検索
         item {
             OutlinedTextField(
-                value = searchQuery,
-                onValueChange = { searchQuery = it },
-                label = { Text("停留所名で検索") },
+                value = originSearchQuery,
+                onValueChange = { originSearchQuery = it },
+                label = { Text("乗車停留所を検索") },
                 modifier = Modifier.fillMaxWidth()
             )
         }
 
-        // Search results
-        if (searchResults.isNotEmpty()) {
-            items(searchResults.take(10)) { stop ->
+        if (originSearchResults.isNotEmpty()) {
+            items(originSearchResults.take(10)) { stop ->
                 Button(
                     onClick = {
-                        selectedStop = stop
-                        searchQuery = stop.stopName
-                        searchResults = emptyList()
-                        allArrivals = emptyList()
+                        originStop = stop
+                        originSearchQuery = stop.stopName
+                        originSearchResults = emptyList()
                         arrivals = emptyList()
                         arrivalStatus = ""
                     },
@@ -255,164 +297,139 @@ fun MainScreen(
             }
         }
 
-        // Selected stop info
-        selectedStop?.let { stop ->
+        originStop?.let { origin ->
             item {
-                Text(text = "選択: ${stop.stopName}", modifier = Modifier.padding(top = 8.dp))
+                Text(text = "乗車: ${origin.stopName}", modifier = Modifier.padding(top = 8.dp))
             }
+        }
 
-            // Route filter (collapsible)
-            if (routesForStop.size > 1) {
-                item {
-                    Button(
-                        onClick = { routeFilterExpanded = !routeFilterExpanded },
-                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                    ) {
-                        Text(if (routeFilterExpanded) "路線フィルターを閉じる" else "路線フィルターを開く")
-                    }
-                }
-                if (routeFilterExpanded) {
-                    item {
-                        OutlinedTextField(
-                            value = routeSearchQuery,
-                            onValueChange = { routeSearchQuery = it },
-                            label = { Text("路線名で絞り込み") },
-                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp)
-                        )
-                    }
-                    item {
-                        val filteredRoutes = if (routeSearchQuery.isBlank()) {
-                            routesForStop
-                        } else {
-                            routesForStop.filter { r ->
-                                (r.routeLongName ?: "").contains(routeSearchQuery, ignoreCase = true) ||
-                                    (r.routeShortName ?: "").contains(routeSearchQuery, ignoreCase = true)
-                            }
-                        }
-                        FlowRow(
-                            horizontalArrangement = Arrangement.spacedBy(4.dp),
-                            verticalArrangement = Arrangement.spacedBy(4.dp),
-                            modifier = Modifier.fillMaxWidth()
-                        ) {
-                            FilterChip(
-                                selected = selectedRouteId == null,
-                                onClick = {
-                                    selectedRouteId = null
-                                    arrivals = allArrivals
-                                    arrivalStatus = "到着予測: ${arrivals.size} 件"
-                                },
-                                label = { Text("全て") }
-                            )
-                            filteredRoutes.forEach { route ->
-                                FilterChip(
-                                    selected = selectedRouteId == route.routeId,
-                                    onClick = {
-                                        selectedRouteId = route.routeId
-                                        arrivals = allArrivals.filter { it.prediction.routeId == route.routeId }
-                                        arrivalStatus = "到着予測: ${arrivals.size} 件"
-                                    },
-                                    label = { Text(route.routeLongName ?: route.routeShortName ?: route.routeId) }
-                                )
-                            }
-                        }
-                    }
-                }
-            }
+        // 降車停留所検索
+        item {
+            OutlinedTextField(
+                value = destSearchQuery,
+                onValueChange = { destSearchQuery = it },
+                label = { Text("降車停留所を検索 (任意)") },
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+            )
+        }
 
-            // Action buttons
-            item {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
+        if (destSearchResults.isNotEmpty()) {
+            items(destSearchResults.take(10)) { stop ->
+                Button(
+                    onClick = {
+                        destStop = stop
+                        destSearchQuery = stop.stopName
+                        destSearchResults = emptyList()
+                        arrivals = emptyList()
+                        arrivalStatus = ""
+                    },
+                    modifier = Modifier.fillMaxWidth()
                 ) {
-                    Button(
-                        onClick = { fetchTrigger++ },
-                        enabled = !arrivalRunning,
+                    Text("${stop.stopName} (${GtfsRepository.baseStopId(stop.stopId)})")
+                }
+            }
+        }
+
+        destStop?.let { dest ->
+            item {
+                Text(text = "降車: ${dest.stopName}", modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+
+        // 取得ボタン
+        item {
+            Row(
+                modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Button(
+                    onClick = { fetchTrigger++ },
+                    enabled = !arrivalRunning && originStop != null,
+                    modifier = Modifier.weight(1f)
+                ) {
+                    Text("取得")
+                }
+                Button(
+                    onClick = {
+                        val origin = originStop ?: return@Button
+                        if (monitoring) {
+                            val intent = Intent(context, RealtimeMonitorService::class.java).apply {
+                                action = RealtimeMonitorService.ACTION_STOP
+                            }
+                            context.startService(intent)
+                            monitoring = false
+                        } else {
+                            if (!activity.hasNotificationPermission()) {
+                                activity.requestNotificationPermission()
+                                return@Button
+                            }
+                            val intent = Intent(context, RealtimeMonitorService::class.java).apply {
+                                putExtra(RealtimeMonitorService.EXTRA_FEED_ID, GtfsRepository.DEFAULT_FEED_ID)
+                                putExtra(RealtimeMonitorService.EXTRA_STOP_ID, origin.stopId)
+                                putExtra(RealtimeMonitorService.EXTRA_STOP_NAME, origin.stopName)
+                                if (selectedTripId != null) {
+                                    putExtra(RealtimeMonitorService.EXTRA_SELECTED_TRIP_ID, selectedTripId)
+                                }
+                            }
+                            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                context.startForegroundService(intent)
+                            } else {
+                                context.startService(intent)
+                            }
+                            monitoring = true
+                        }
+                    },
+                    modifier = Modifier.padding(start = 8.dp)
+                ) {
+                    Text(if (monitoring) "監視停止" else "監視開始")
+                }
+            }
+        }
+
+        // Status
+        if (arrivalStatus.isNotEmpty()) {
+            item {
+                Text(text = arrivalStatus, modifier = Modifier.padding(top = 4.dp))
+            }
+        }
+
+        if (arrivalRunning) {
+            item {
+                CircularProgressIndicator(modifier = Modifier.padding(top = 8.dp))
+            }
+        }
+
+        // Network state
+        item {
+            Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))
+        }
+
+        // Arrivals
+        items(arrivals) { a ->
+            val isSelected = selectedTripId == a.prediction.tripId
+            Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}",
                         modifier = Modifier.weight(1f)
-                    ) {
-                        Text("取得")
-                    }
+                    )
                     Button(
                         onClick = {
-                            if (monitoring) {
-                                val intent = Intent(context, RealtimeMonitorService::class.java).apply {
-                                    action = RealtimeMonitorService.ACTION_STOP
-                                }
-                                context.startService(intent)
-                                monitoring = false
-                            } else {
-                                if (!activity.hasNotificationPermission()) {
-                                    activity.requestNotificationPermission()
-                                    return@Button
-                                }
-                                val intent = Intent(context, RealtimeMonitorService::class.java).apply {
-                                    putExtra(RealtimeMonitorService.EXTRA_FEED_ID, GtfsRepository.DEFAULT_FEED_ID)
-                                    putExtra(RealtimeMonitorService.EXTRA_STOP_ID, stop.stopId)
-                                    putExtra(RealtimeMonitorService.EXTRA_STOP_NAME, stop.stopName)
-                                    if (selectedTripId != null) {
-                                        putExtra(RealtimeMonitorService.EXTRA_SELECTED_TRIP_ID, selectedTripId)
-                                    }
-                                }
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                    context.startForegroundService(intent)
-                                } else {
-                                    context.startService(intent)
-                                }
-                                monitoring = true
-                            }
+                            selectedTripId = if (isSelected) null else a.prediction.tripId
                         },
                         modifier = Modifier.padding(start = 8.dp)
                     ) {
-                        Text(if (monitoring) "監視停止" else "監視開始")
+                        Text(if (isSelected) "選択中" else "選択")
                     }
                 }
-            }
-
-            // Status
-            if (arrivalStatus.isNotEmpty()) {
-                item {
-                    Text(text = arrivalStatus, modifier = Modifier.padding(top = 4.dp))
-                }
-            }
-
-            if (arrivalRunning) {
-                item {
-                    CircularProgressIndicator(modifier = Modifier.padding(top = 8.dp))
-                }
-            }
-
-            // Network state
-            item {
-                Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))
-            }
-
-            // Arrivals
-            items(arrivals) { a ->
-                val isSelected = selectedTripId == a.prediction.tripId
-                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                    Row(
-                        verticalAlignment = Alignment.CenterVertically,
-                        modifier = Modifier.fillMaxWidth()
-                    ) {
-                        Text(
-                            text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}",
-                            modifier = Modifier.weight(1f)
-                        )
-                        Button(
-                            onClick = {
-                                selectedTripId = if (isSelected) null else a.prediction.tripId
-                            },
-                            modifier = Modifier.padding(start = 8.dp)
-                        ) {
-                            Text(if (isSelected) "選択中" else "選択")
-                        }
-                    }
-                    Text(text = "停留所: ${a.stopName ?: GtfsRepository.baseStopId(a.prediction.stopId)}")
-                    Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
-                    val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
-                    if (mins != null) {
-                        Text(text = "あと ${mins} 分")
-                    }
+                Text(text = "停留所: ${a.stopName ?: GtfsRepository.baseStopId(a.prediction.stopId)}")
+                Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
+                val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
+                if (mins != null) {
+                    Text(text = "あと ${mins} 分")
                 }
             }
         }

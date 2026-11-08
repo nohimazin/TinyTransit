@@ -154,7 +154,11 @@ class RealtimeMonitorService : Service() {
                 if (selTrip != null) {
                     filtered = filtered.filter { it.tripId == selTrip }
                 }
-                updateNotification(currentStopName, filtered, controller?.lastUpdateEpoch?.value)
+                // フィードのタイムスタンプ (GTFS-RT が提供する更新時刻) を使用
+                val feedTimestamp = filtered.firstOrNull()?.feedTimestamp
+                    ?: predictions.firstOrNull()?.feedTimestamp
+                val feedTimestampMs = feedTimestamp?.let { it * 1000 }
+                updateNotification(currentStopName, filtered, feedTimestampMs)
             }
         }
     }
