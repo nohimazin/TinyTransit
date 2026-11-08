@@ -11,6 +11,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -204,12 +205,13 @@ fun MainScreen(
                         selectedStop = stop
                         searchQuery = stop.stopName
                         searchResults = emptyList()
+                        allArrivals = emptyList()
                         arrivals = emptyList()
                         arrivalStatus = ""
                     },
                     modifier = Modifier.fillMaxWidth()
                 ) {
-                    Text("${stop.stopName} (${stop.stopId})")
+                    Text("${stop.stopName} (${GtfsRepository.baseStopId(stop.stopId)})")
                 }
             }
         }
@@ -223,8 +225,9 @@ fun MainScreen(
             // Route filter chips
             if (routesForStop.size > 1) {
                 item {
-                    Row(
+                    FlowRow(
                         horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        verticalArrangement = Arrangement.spacedBy(4.dp),
                         modifier = Modifier.fillMaxWidth()
                     ) {
                         FilterChip(
@@ -244,7 +247,7 @@ fun MainScreen(
                                     arrivals = allArrivals.filter { it.prediction.routeId == route.routeId }
                                     arrivalStatus = "到着予測: ${arrivals.size} 件"
                                 },
-                                label = { Text(route.routeShortName ?: route.routeId) }
+                                label = { Text(route.routeLongName ?: route.routeShortName ?: route.routeId) }
                             )
                         }
                     }
@@ -314,7 +317,7 @@ fun MainScreen(
             items(arrivals) { a ->
                 Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                     Text(text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}")
-                    Text(text = "停留所: ${a.stopName ?: a.prediction.stopId}")
+                    Text(text = "停留所: ${a.stopName ?: GtfsRepository.baseStopId(a.prediction.stopId)}")
                     Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
                     val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
                     if (mins != null) {

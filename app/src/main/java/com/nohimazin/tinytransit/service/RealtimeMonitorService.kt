@@ -103,7 +103,8 @@ class RealtimeMonitorService : Service() {
         serviceScope.launch {
             controller?.latestPredictions?.collectLatest { predictions ->
                 val filtered = if (stopId != null) {
-                    predictions.filter { it.stopId == stopId }
+                    val baseId = GtfsRepository.baseStopId(stopId)
+                    predictions.filter { GtfsRepository.baseStopId(it.stopId) == baseId }
                 } else {
                     predictions
                 }

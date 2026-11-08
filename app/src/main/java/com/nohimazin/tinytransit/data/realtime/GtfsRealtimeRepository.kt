@@ -3,6 +3,7 @@ package com.nohimazin.tinytransit.data.realtime
 import android.content.Context
 import com.google.transit.realtime.GtfsRealtime
 import com.nohimazin.tinytransit.data.db.TinyTransitDatabase
+import com.nohimazin.tinytransit.data.repository.GtfsRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import android.util.Log
@@ -236,8 +237,15 @@ class GtfsRealtimeRepository(
         stopId: String,
         url: String
     ): List<StopArrival> = withContext(Dispatchers.IO) {
+        val baseId = GtfsRepository.baseStopId(stopId)
+        // 基底 ID に紐づく全方向の停留所 ID を取得
+        val allStops = database.stopDao().getAll(feedId)
+        val variantIds = allStops.filter { GtfsRepository.baseStopId(it.stopId) == baseId }
+            .map { it.stopId }.toSet()
+        val effectiveIds = if (variantIds.isEmpty()) setOf(stopId) else variantIds
+
         val predictions = fetchAndDecodeTripUpdates(feedId, url)
-            .filter { it.stopId == stopId }
+            .filter { it.stopId in effectiveIds }
 
         predictions.map { p ->
             val trip = database.tripDao().get(feedId, p.tripId)

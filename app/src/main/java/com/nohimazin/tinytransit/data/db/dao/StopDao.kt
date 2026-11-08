@@ -20,6 +20,9 @@ interface StopDao {
     @Query("SELECT COUNT(*) FROM stops WHERE feedId = :feedId")
     suspend fun count(feedId: String): Int
 
+    @Query("SELECT * FROM stops WHERE feedId = :feedId")
+    suspend fun getAll(feedId: String): List<StopEntity>
+
     @Query("DELETE FROM stops WHERE feedId = :feedId")
     suspend fun deleteByFeed(feedId: String)
 }

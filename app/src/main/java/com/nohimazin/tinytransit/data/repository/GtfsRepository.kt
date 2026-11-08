@@ -19,10 +19,6 @@ class GtfsRepository(
     private val database: TinyTransitDatabase,
     private val httpClient: OkHttpClient
 ) {
-    companion object {
-        const val DEFAULT_FEED_ID = "sankobus"
-    }
-
     suspend fun importStaticGtfs(
         feedId: String,
         url: String,
@@ -255,13 +251,63 @@ class GtfsRepository(
         return if (f.exists()) f.readText(Charsets.UTF_8) else ""
     }
 
+    companion object {
+        const val DEFAULT_FEED_ID = "sankobus"
+
+        /**
+         * 停留所 ID から基底 ID を取得します。
+         * 例: "100393_1" -> "100393", "100393_2" -> "100393"
+         * アンダースコア後の数字は進行方向を表すため、統合して扱います。
+         */
+        fun baseStopId(stopId: String): String {
+            val idx = stopId.lastIndexOf('_')
+            if (idx > 0 && idx < stopId.length - 1) {
+                val suffix = stopId.substring(idx + 1)
+                if (suffix.all { it.isDigit() }) {
+                    return stopId.substring(0, idx)
+                }
+            }
+            return stopId
+        }
+
+        /**
+         * 停留所 ID の方向サフィックスを取得します。
+         * 例: "100393_1" -> "1", "100393" -> ""
+         */
+        fun stopDirection(stopId: String): String {
+            val idx = stopId.lastIndexOf('_')
+            if (idx > 0 && idx < stopId.length - 1) {
+                val suffix = stopId.substring(idx + 1)
+                if (suffix.all { it.isDigit() }) {
+                    return suffix
+                }
+            }
+            return ""
+        }
+    }
+
     /**
      * 停留所名で検索します。
+     * アンダースコア後の数字だけが異なる停留所は統合して 1 件にまとめます。
      */
     suspend fun searchStops(feedId: String, query: String): List<com.nohimazin.tinytransit.data.db.entity.StopEntity> =
         withContext(Dispatchers.IO) {
-            if (query.isBlank()) emptyList()
-            else database.stopDao().searchByName(feedId, query, 20)
+            if (query.isBlank()) return@withContext emptyList()
+            val results = database.stopDao().searchByName(feedId, query, 50)
+            // 基底 ID でグループ化し、各グループの最初の 1 件を返す
+            val seen = mutableSetOf<String>()
+            results.filter { stop ->
+                val base = GtfsRepository.baseStopId(stop.stopId)
+                if (base in seen) false else { seen.add(base); true }
+            }
+        }
+
+    /**
+     * 基底停留所 ID に紐づく全方向の停留所を取得します。
+     */
+    suspend fun getStopVariants(feedId: String, baseStopId: String): List<com.nohimazin.tinytransit.data.db.entity.StopEntity> =
+        withContext(Dispatchers.IO) {
+            database.stopDao().getAll(feedId).filter { GtfsRepository.baseStopId(it.stopId) == baseStopId }
         }
 
     /**
@@ -269,8 +315,10 @@ class GtfsRepository(
      */
     suspend fun getRoutesForStop(feedId: String, stopId: String): List<com.nohimazin.tinytransit.data.db.entity.RouteEntity> =
         withContext(Dispatchers.IO) {
-            val stopTimes = database.stopTimeDao().getByStop(feedId, stopId)
-            val tripIds = stopTimes.map { it.tripId }.distinct()
+            val baseId = baseStopId(stopId)
+            val variants = getStopVariants(feedId, baseId)
+            val allStopTimes = variants.flatMap { v -> database.stopTimeDao().getByStop(feedId, v.stopId) }
+            val tripIds = allStopTimes.map { it.tripId }.distinct()
             val routeIds = tripIds.mapNotNull { tid ->
                 database.tripDao().get(feedId, tid)?.routeId
             }.distinct()
