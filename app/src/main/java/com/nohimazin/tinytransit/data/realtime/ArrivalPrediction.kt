@@ -47,16 +47,38 @@ data class ArrivalPrediction(
 
     /**
      * 遅延を人間可読な文字列で返します。
+     * delaySeconds が null の場合は predictedArrivalEpoch と scheduledArrivalSeconds から算出します。
      */
     fun delayText(): String {
         if (isCanceled) return "運休"
         if (isSkipped) return "通過"
-        val d = delaySeconds ?: return "定刻"
+        val d = delaySeconds ?: computeDelay() ?: return "定刻"
         return when {
             d == 0 -> "定刻"
             d > 0 -> "${d / 60}分遅れ"
             else -> "${-d / 60}分早い"
         }
+    }
+
+    /**
+     * predictedArrivalEpoch と scheduledArrivalSeconds から遅延秒数を算出します。
+     * predictedArrivalEpoch (Unix epoch) を事業者のタイムゾーンでの
+     * サービス日開始からの経過秒数に変換し、scheduled との差を求めます。
+     */
+    private fun computeDelay(): Int? {
+        val epoch = predictedArrivalEpoch ?: return null
+        val sched = scheduledArrivalSeconds ?: return null
+        val tz = TimeZone.getTimeZone(agencyTimezone ?: "Asia/Tokyo")
+        val cal = java.util.Calendar.getInstance(tz)
+        cal.timeInMillis = epoch * 1000
+        val predSeconds = cal.get(java.util.Calendar.HOUR_OF_DAY) * 3600 +
+            cal.get(java.util.Calendar.MINUTE) * 60 +
+            cal.get(java.util.Calendar.SECOND)
+        // 日付をまたぐ場合の補正（predicted が翌日 0-3時、scheduled が 23-24時）
+        var diff = predSeconds - sched.toInt()
+        if (diff < -43200) diff += 86400
+        if (diff > 43200) diff -= 86400
+        return diff
     }
 
     /**

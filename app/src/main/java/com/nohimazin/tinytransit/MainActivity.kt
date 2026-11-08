@@ -23,6 +23,7 @@ import androidx.compose.material3.FilterChip
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -92,22 +93,19 @@ fun MainScreen(
     var importProgress by remember { mutableStateOf(0f) }
     var importRunning by remember { mutableStateOf(true) }
 
-    // 停留所検索
     var searchQuery by remember { mutableStateOf("") }
     var searchResults by remember { mutableStateOf<List<StopEntity>>(emptyList()) }
     var selectedStop by remember { mutableStateOf<StopEntity?>(null) }
 
-    // 路線フィルター
     var routesForStop by remember { mutableStateOf<List<com.nohimazin.tinytransit.data.db.entity.RouteEntity>>(emptyList()) }
     var selectedRouteId by remember { mutableStateOf<String?>(null) }
 
-    // 到着予測
+    var allArrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
     var arrivals by remember { mutableStateOf<List<StopArrival>>(emptyList()) }
     var arrivalStatus by remember { mutableStateOf("") }
     var arrivalRunning by remember { mutableStateOf(false) }
     var fetchTrigger by remember { mutableStateOf(0) }
 
-    // バックグラウンド監視
     var monitoring by remember { mutableStateOf(RealtimeMonitorService.isRunning) }
 
     LaunchedEffect(Unit) {
@@ -129,7 +127,6 @@ fun MainScreen(
         }
     }
 
-    // 停留所検索
     LaunchedEffect(searchQuery) {
         if (searchQuery.length >= 2) {
             searchResults = gtfsRepository.searchStops(GtfsRepository.DEFAULT_FEED_ID, searchQuery)
@@ -138,14 +135,12 @@ fun MainScreen(
         }
     }
 
-    // 停留所選択時の路線取得
     LaunchedEffect(selectedStop) {
         val stop = selectedStop ?: return@LaunchedEffect
         routesForStop = gtfsRepository.getRoutesForStop(GtfsRepository.DEFAULT_FEED_ID, stop.stopId)
-        selectedRouteId = null // フィルターをリセット
+        selectedRouteId = null
     }
 
-    // 到着予測取得
     LaunchedEffect(fetchTrigger) {
         if (fetchTrigger == 0) return@LaunchedEffect
         val stop = selectedStop
@@ -161,6 +156,7 @@ fun MainScreen(
                 stopId = stop.stopId,
                 url = "https://km.bus-vision.jp/realtime/sankobus_trip_update.bin"
             )
+            allArrivals = result
             arrivals = if (selectedRouteId != null) {
                 result.filter { it.prediction.routeId == selectedRouteId }
             } else {
@@ -174,67 +170,89 @@ fun MainScreen(
         }
     }
 
-    Column(
+    LazyColumn(
         modifier = modifier.fillMaxSize().padding(16.dp),
-        verticalArrangement = Arrangement.Top,
-        horizontalAlignment = Alignment.CenterHorizontally
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
-        if (importRunning) {
-            CircularProgressIndicator(progress = { importProgress })
-            Text(text = importStatus)
-        } else {
-            Text(text = importStatus)
+        // Import status
+        item {
+            if (importRunning) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    CircularProgressIndicator(progress = { importProgress }, modifier = Modifier.padding(end = 8.dp))
+                    Text(text = importStatus)
+                }
+            } else {
+                Text(text = importStatus)
+            }
+        }
 
-            // 停留所検索
+        // Stop search
+        item {
             OutlinedTextField(
                 value = searchQuery,
                 onValueChange = { searchQuery = it },
                 label = { Text("停留所名で検索") },
-                modifier = Modifier.fillMaxWidth().padding(top = 8.dp)
+                modifier = Modifier.fillMaxWidth()
             )
+        }
 
-            if (searchResults.isNotEmpty()) {
-                LazyColumn(modifier = Modifier.fillMaxWidth().padding(top = 4.dp)) {
-                    items(searchResults.take(10)) { stop ->
-                        Button(
-                            onClick = {
-                                selectedStop = stop
-                                searchQuery = stop.stopName
-                                searchResults = emptyList()
-                            },
-                            modifier = Modifier.fillMaxWidth().padding(vertical = 2.dp)
-                        ) {
-                            Text("${stop.stopName} (${stop.stopId})")
-                        }
-                    }
+        // Search results
+        if (searchResults.isNotEmpty()) {
+            items(searchResults.take(10)) { stop ->
+                Button(
+                    onClick = {
+                        selectedStop = stop
+                        searchQuery = stop.stopName
+                        searchResults = emptyList()
+                        arrivals = emptyList()
+                        arrivalStatus = ""
+                    },
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text("${stop.stopName} (${stop.stopId})")
                 }
             }
+        }
 
-            selectedStop?.let { stop ->
+        // Selected stop info
+        selectedStop?.let { stop ->
+            item {
                 Text(text = "選択: ${stop.stopName}", modifier = Modifier.padding(top = 8.dp))
+            }
 
-                // 路線フィルター
-                if (routesForStop.size > 1) {
+            // Route filter chips
+            if (routesForStop.size > 1) {
+                item {
                     Row(
-                        modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
-                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                        horizontalArrangement = Arrangement.spacedBy(4.dp),
+                        modifier = Modifier.fillMaxWidth()
                     ) {
                         FilterChip(
                             selected = selectedRouteId == null,
-                            onClick = { selectedRouteId = null },
+                            onClick = {
+                                selectedRouteId = null
+                                arrivals = allArrivals
+                                arrivalStatus = "到着予測: ${arrivals.size} 件"
+                            },
                             label = { Text("全て") }
                         )
                         routesForStop.forEach { route ->
                             FilterChip(
                                 selected = selectedRouteId == route.routeId,
-                                onClick = { selectedRouteId = route.routeId },
+                                onClick = {
+                                    selectedRouteId = route.routeId
+                                    arrivals = allArrivals.filter { it.prediction.routeId == route.routeId }
+                                    arrivalStatus = "到着予測: ${arrivals.size} 件"
+                                },
                                 label = { Text(route.routeShortName ?: route.routeId) }
                             )
                         }
                     }
                 }
+            }
 
-                // 取得ボタン
+            // Action buttons
+            item {
                 Row(
                     modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
                     verticalAlignment = Alignment.CenterVertically
@@ -279,23 +297,28 @@ fun MainScreen(
                 }
             }
 
-            if (arrivalRunning) {
-                CircularProgressIndicator(modifier = Modifier.padding(top = 8.dp))
-            }
+            // Status
             if (arrivalStatus.isNotEmpty()) {
-                Text(text = arrivalStatus, modifier = Modifier.padding(top = 8.dp))
+                item {
+                    Text(text = arrivalStatus, modifier = Modifier.padding(top = 4.dp))
+                }
             }
 
-            LazyColumn(modifier = Modifier.fillMaxWidth().padding(top = 8.dp)) {
-                items(arrivals) { a ->
-                    Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
-                        Text(text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}")
-                        Text(text = "停留所: ${a.stopName ?: a.prediction.stopId}")
-                        Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
-                        val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
-                        if (mins != null) {
-                            Text(text = "あと ${mins} 分")
-                        }
+            if (arrivalRunning) {
+                item {
+                    CircularProgressIndicator(modifier = Modifier.padding(top = 8.dp))
+                }
+            }
+
+            // Arrivals
+            items(arrivals) { a ->
+                Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
+                    Text(text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}")
+                    Text(text = "停留所: ${a.stopName ?: a.prediction.stopId}")
+                    Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
+                    val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
+                    if (mins != null) {
+                        Text(text = "あと ${mins} 分")
                     }
                 }
             }

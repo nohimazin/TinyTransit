@@ -5,6 +5,7 @@ import com.google.transit.realtime.GtfsRealtime
 import com.nohimazin.tinytransit.data.db.TinyTransitDatabase
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import android.util.Log
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
@@ -72,6 +73,10 @@ class GtfsRealtimeRepository(
                 val arrivalEvent = if (stu.hasArrival()) stu.arrival else null
                 val predictedArrival = arrivalEvent?.time?.takeIf { it > 0 }
                 val delay = arrivalEvent?.delay
+
+                if (predictions.size < 3) {
+                    Log.d("GtfsRT", "trip=$tripId stop=$stopId seq=$stopSequence hasArrival=${stu.hasArrival()} time=${arrivalEvent?.time} delay=${arrivalEvent?.delay} hasDeparture=${stu.hasDeparture()}")
+                }
 
                 // 静的 GTFS の scheduled arrival を取得
                 val scheduledArrival = getStaticScheduledArrival(feedId, tripId, stopSequence, stopId)
