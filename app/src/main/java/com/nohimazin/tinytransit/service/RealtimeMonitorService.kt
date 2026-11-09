@@ -81,9 +81,15 @@ class RealtimeMonitorService : Service() {
             if (!isRunning) {
                 val notification = buildForegroundNotification()
                 startForeground(NOTIFICATION_ID_BASE, notification)
-                startMonitoring()
+                controller?.setMonitoredStops(monitoredOriginStopIds)
+        startMonitoring()
                 isRunning = true
             } else {
+                controller?.setMonitoredStops(monitoredOriginStopIds)
+                controller?.setMonitoredRoutes(monitoredRoutes.map { r ->
+                    val parts = r.split("->")
+                    parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
+                }.toSet())
                 controller?.let { ctrl ->
                     serviceScope.launch { refreshNotification(ctrl) }
                 }
@@ -110,6 +116,11 @@ class RealtimeMonitorService : Service() {
                 // originStopId が他の経路でも使われているか確認
                 val stillUsed = monitoredRoutes.any { it.startsWith("$originStopId->") }
                 if (!stillUsed) monitoredOriginStopIds.remove(originStopId)
+                controller?.setMonitoredStops(monitoredOriginStopIds)
+                controller?.setMonitoredRoutes(monitoredRoutes.map { r ->
+                    val parts = r.split("->")
+                    parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
+                }.toSet())
                 controller?.let { ctrl ->
                     serviceScope.launch { refreshNotification(ctrl) }
                 }
@@ -127,12 +138,22 @@ class RealtimeMonitorService : Service() {
                 monitoredRouteNames[routeKey] = stopName ?: stopId
                 monitoredOriginStopIds.add(stopId)
             }
+            controller?.setMonitoredStops(monitoredOriginStopIds)
+            controller?.setMonitoredRoutes(monitoredRoutes.map { r ->
+                val parts = r.split("->")
+                parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
+            }.toSet())
         }
 
         if (!isRunning) {
             val notification = buildForegroundNotification()
             startForeground(NOTIFICATION_ID_BASE, notification)
-            startMonitoring()
+            controller?.setMonitoredStops(monitoredOriginStopIds)
+            controller?.setMonitoredRoutes(monitoredRoutes.map { r ->
+                val parts = r.split("->")
+                parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
+            }.toSet())
+        startMonitoring()
             isRunning = true
         }
         return START_STICKY
@@ -146,6 +167,11 @@ class RealtimeMonitorService : Service() {
             httpClient = app.realtimeHttpClient,
             scope = serviceScope
         ).apply {
+            setMonitoredStops(monitoredOriginStopIds)
+            setMonitoredRoutes(monitoredRoutes.map { r ->
+                val parts = r.split("->")
+                parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
+            }.toSet())
             configure(
                 feedId = GtfsRepository.DEFAULT_FEED_ID,
                 stopId = monitoredOriginStopIds.firstOrNull(),
@@ -157,6 +183,41 @@ class RealtimeMonitorService : Service() {
         serviceScope.launch {
             controller?.latestPredictions?.collectLatest { predictions ->
                 refreshNotification(controller!!)
+            }
+        }
+
+        // ダウンロード進捗を監視して通知を更新
+        serviceScope.launch {
+            controller?.downloadProgress?.collectLatest { progress ->
+                if (progress != null && RealtimeUpdateController.isShowDownloadProgress(this@RealtimeMonitorService)) {
+                    val (downloaded, total) = progress
+                    val notification = buildProgressNotification(downloaded, total)
+                    val nm = NotificationManagerCompat.from(this@RealtimeMonitorService)
+                    try {
+                        nm.notify(NOTIFICATION_ID_BASE, notification)
+                    } catch (e: SecurityException) {
+                        Log.w(TAG, "Notification permission denied: ${e.message}")
+                    }
+                }
+            }
+        }
+
+        // 待機モードを監視して通知を更新
+        serviceScope.launch {
+            controller?.isWaiting?.collectLatest { waiting ->
+                val nm = NotificationManagerCompat.from(this@RealtimeMonitorService)
+                try {
+                    if (waiting) {
+                        val resumeAt = controller?.nextResumeEpochMs?.value ?: 0L
+                        val notification = buildWaitingNotification(resumeAt)
+                        nm.notify(NOTIFICATION_ID_BASE, notification)
+                    } else {
+                        // 待機解除: フォアグラウンド通知に戻す
+                        nm.notify(NOTIFICATION_ID_BASE, buildForegroundNotification())
+                    }
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Notification permission denied: ${e.message}")
+                }
             }
         }
     }
@@ -210,11 +271,10 @@ class RealtimeMonitorService : Service() {
                             .getByStop(GtfsRepository.DEFAULT_FEED_ID, v)
                     }
                     // 同一 trip が同じ停留所を複数回経由する場合、最小の stopSequence を使用
-                    val originSeqMap = originStopTimes.groupBy { it.tripId }
-                        .mapValues { (_, sts) -> sts.minOf { it.stopSequence } }
+                    val originByTrip = originStopTimes.groupBy { it.tripId }
                     destStopTimes.filter { dst ->
-                        val originSeq = originSeqMap[dst.tripId]
-                        originSeq != null && originSeq < dst.stopSequence
+                        val originSts = originByTrip[dst.tripId] ?: return@filter false
+                        originSts.any { originSt -> originSt.stopSequence < dst.stopSequence }
                     }.map { it.tripId }.toSet()
                 } catch (e: Exception) {
                     emptySet()
@@ -222,6 +282,9 @@ class RealtimeMonitorService : Service() {
                 // commonTrips が空でない場合のみフィルタ (空の場合はフィルタしない)
                 if (commonTrips.isNotEmpty()) {
                     filtered = filtered.filter { it.tripId in commonTrips }
+                    android.util.Log.d("GtfsRT", "route=$routeKey commonTrips=${commonTrips.size} filtered=${filtered.size} sampleTrips=${filtered.take(3).map { it.tripId }}")
+                } else {
+                    android.util.Log.w("GtfsRT", "No common trips for route=$routeKey dest=$destStopId, showing all origin predictions. commonTrips=${commonTrips.size} filtered=${filtered.size}")
                 }
 
                 // GTFS-RT に該当便がない場合 → 静的時刻表にフォールバック
@@ -319,19 +382,12 @@ class RealtimeMonitorService : Service() {
         } else {
             val nearest = predictions.minByOrNull { it.predictedArrivalEpoch ?: Long.MAX_VALUE }
             if (nearest != null) {
-                val app = application as TinyTransitApp
-                val route = nearest.routeId?.let { rid ->
-                    kotlinx.coroutines.runBlocking {
-                        app.database.routeDao().get(nearest.feedId, rid)
-                    }
-                }
-                val routeNameDisplay = route?.routeLongName ?: route?.routeShortName ?: nearest.routeId ?: ""
                 val time = nearest.predictedTimeText()
                 val delay = nearest.delayText()
                 val mins = nearest.minutesUntil(System.currentTimeMillis() / 1000)
                 val minsText = if (mins != null) "あと${mins}分" else ""
-                sb.append("$routeNameDisplay - $time")
-                sb.append("\n遅延: $delay")
+                sb.append("$routeName")
+                sb.append("\n到着: $time ($delay)")
                 if (minsText.isNotEmpty()) {
                     sb.append("  $minsText")
                 }
@@ -476,6 +532,81 @@ class RealtimeMonitorService : Service() {
             .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止", stopPending)
             .setPriority(NotificationCompat.PRIORITY_LOW)
             .build()
+    }
+
+    private fun buildWaitingNotification(resumeAtEpochMs: Long): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openPending = PendingIntent.getActivity(
+            this, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopIntent = Intent(this, RealtimeMonitorService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPending = PendingIntent.getService(
+            this, 1, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val resumeText = if (resumeAtEpochMs > 0) {
+            val sdf = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault())
+            sdf.timeZone = java.util.TimeZone.getTimeZone("Asia/Tokyo")
+            "再開予定: ${sdf.format(java.util.Date(resumeAtEpochMs))}"
+        } else {
+            "しばらくお待ちください"
+        }
+
+        val title = "TinyTransit - 待機中"
+        val content = "監視対象の路線で現在走行中のバスがないため、通信を一時停止しています。\n$resumeText"
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle(title)
+            .setContentText(content)
+            .setStyle(NotificationCompat.BigTextStyle().bigText(content))
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(openPending)
+            .addAction(android.R.drawable.ic_menu_close_clear_cancel, "停止", stopPending)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+
+        if (resumeAtEpochMs > 0) {
+            builder.setWhen(resumeAtEpochMs)
+        }
+
+        return builder.build()
+    }
+
+    private fun buildProgressNotification(downloaded: Long, total: Long): Notification {
+        val openIntent = Intent(this, MainActivity::class.java).apply {
+            flags = Intent.FLAG_ACTIVITY_SINGLE_TOP or Intent.FLAG_ACTIVITY_CLEAR_TOP
+        }
+        val openPending = PendingIntent.getActivity(
+            this, 0, openIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val builder = NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("TinyTransit - ダウンロード中")
+            .setSmallIcon(android.R.drawable.ic_menu_mylocation)
+            .setOngoing(true)
+            .setOnlyAlertOnce(true)
+            .setContentIntent(openPending)
+            .setPriority(NotificationCompat.PRIORITY_LOW)
+
+        if (total > 0) {
+            val percent = (downloaded * 100 / total).toInt()
+            builder.setProgress(total.toInt(), downloaded.toInt(), false)
+            builder.setContentText("${downloaded / 1024}KB / ${total / 1024}KB ($percent%)")
+        } else {
+            builder.setProgress(0, 0, true)
+            builder.setContentText("${downloaded / 1024}KB 受信中...")
+        }
+
+        return builder.build()
     }
 
     private fun buildNotificationTitle(

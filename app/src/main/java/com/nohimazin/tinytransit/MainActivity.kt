@@ -37,6 +37,7 @@ import androidx.core.content.ContextCompat
 import com.nohimazin.tinytransit.data.db.entity.MonitoredRouteEntity
 import com.nohimazin.tinytransit.data.db.entity.StopEntity
 import com.nohimazin.tinytransit.data.realtime.GtfsRealtimeRepository
+import com.nohimazin.tinytransit.data.realtime.RealtimeUpdateController
 import com.nohimazin.tinytransit.data.realtime.StopArrival
 import com.nohimazin.tinytransit.data.repository.GtfsRepository
 import com.nohimazin.tinytransit.service.RealtimeMonitorService
@@ -120,6 +121,8 @@ fun MainScreen(
     // バックグラウンド監視 (経路ごとに管理)
     var monitoringRouteKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var networkStateText by remember { mutableStateOf("") }
+    var pauseWhenNoActive by remember { mutableStateOf(RealtimeUpdateController.isPauseWhenNoActive(context)) }
+    var showDownloadProgress by remember { mutableStateOf(RealtimeUpdateController.isShowDownloadProgress(context)) }
 
     LaunchedEffect(Unit) {
         importRunning = true
@@ -625,6 +628,48 @@ fun MainScreen(
             // Network state
             item {
                 Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))
+            }
+
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(text = "運行時間外は取得停止")
+                    Button(
+                        onClick = {
+                            pauseWhenNoActive = !pauseWhenNoActive
+                            RealtimeUpdateController.setPauseWhenNoActive(context, pauseWhenNoActive)
+                        },
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text(if (pauseWhenNoActive) "ON" else "OFF")
+                    }
+                }
+                Text(
+                    text = "ONにすると、監視対象の路線で現在走行中のバスがない場合、通信を一時停止し、次の便の出発予定時刻の5分前から自動で再開します（最大30分ごとに確認）。通信量を節約できます。",
+                    modifier = Modifier.padding(top = 4.dp),
+                    style = androidx.compose.material3.MaterialTheme.typography.bodySmall
+                )
+            }
+
+            // ダウンロード進捗表示設定
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(text = "ダウンロード進捗を表示")
+                    Button(
+                        onClick = {
+                            showDownloadProgress = !showDownloadProgress
+                            RealtimeUpdateController.setShowDownloadProgress(context, showDownloadProgress)
+                        },
+                        modifier = Modifier.padding(start = 8.dp)
+                    ) {
+                        Text(if (showDownloadProgress) "ON" else "OFF")
+                    }
+                }
             }
         }
     }

@@ -296,11 +296,12 @@ class GtfsRealtimeRepository(
                 database.stopTimeDao().getByStop(feedId, v)
             }
             // 乗車 → 降車の順で停車する便のみ
-            val originSeqMap = allStopTimes.groupBy { it.tripId }
-                .mapValues { (_, sts) -> sts.minOf { it.stopSequence } }
+            // 同一 trip の origin と dest の stop_sequence ペアを確認
+            val originByTrip = allStopTimes.groupBy { it.tripId }
             destStopTimes.filter { dst ->
-                val originSeq = originSeqMap[dst.tripId]
-                originSeq != null && originSeq < dst.stopSequence
+                val originSts = originByTrip[dst.tripId] ?: return@filter false
+                // origin のいずれかの stop_sequence が dest より小さいものがあれば forward
+                originSts.any { originSt -> originSt.stopSequence < dst.stopSequence }
             }.map { it.tripId }.toSet()
         } else null
 

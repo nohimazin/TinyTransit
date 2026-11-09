@@ -40,6 +40,28 @@ class RealtimeUpdateController(
         private const val TAG = "RealtimeCtrl"
         private const val PREFS_NAME = "realtime_settings"
         private const val KEY_INTERVAL_MS = "interval_ms"
+        private const val KEY_SHOW_DOWNLOAD_PROGRESS = "show_download_progress"
+        private const val KEY_PAUSE_WHEN_NO_ACTIVE = "pause_when_no_active"
+
+        fun isShowDownloadProgress(context: Context): Boolean {
+            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_SHOW_DOWNLOAD_PROGRESS, true)
+        }
+
+        fun setShowDownloadProgress(context: Context, value: Boolean) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_SHOW_DOWNLOAD_PROGRESS, value).apply()
+        }
+
+        fun isPauseWhenNoActive(context: Context): Boolean {
+            return context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .getBoolean(KEY_PAUSE_WHEN_NO_ACTIVE, false)
+        }
+
+        fun setPauseWhenNoActive(context: Context, value: Boolean) {
+            context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+                .edit().putBoolean(KEY_PAUSE_WHEN_NO_ACTIVE, value).apply()
+        }
 
         const val INTERVAL_HIGH = 15_000L
         const val INTERVAL_NORMAL = 30_000L
@@ -56,6 +78,20 @@ class RealtimeUpdateController(
         set(value) {
             field = value
             prefs.edit().putLong(KEY_INTERVAL_MS, value).apply()
+        }
+
+    @Volatile
+    var showDownloadProgress: Boolean = prefs.getBoolean(KEY_SHOW_DOWNLOAD_PROGRESS, true)
+        set(value) {
+            field = value
+            prefs.edit().putBoolean(KEY_SHOW_DOWNLOAD_PROGRESS, value).apply()
+        }
+
+    @Volatile
+    var pauseWhenNoActiveBuses: Boolean = prefs.getBoolean(KEY_PAUSE_WHEN_NO_ACTIVE, false)
+        set(value) {
+            field = value
+            prefs.edit().putBoolean(KEY_PAUSE_WHEN_NO_ACTIVE, value).apply()
         }
 
     // 状態
@@ -83,11 +119,43 @@ class RealtimeUpdateController(
     private val _latestPredictions = MutableStateFlow<List<ArrivalPrediction>>(emptyList())
     val latestPredictions: StateFlow<List<ArrivalPrediction>> = _latestPredictions
 
+    // 待機モード (運行時間外) の状態
+    private val _isWaiting = MutableStateFlow(false)
+    val isWaiting: StateFlow<Boolean> = _isWaiting
+
+    // 待機モードからの再開予定時刻 (epoch ms)。0 = 未設定
+    private val _nextResumeEpochMs = MutableStateFlow(0L)
+    val nextResumeEpochMs: StateFlow<Long> = _nextResumeEpochMs
+
+    // ダウンロード進捗 (downloaded, total) or null
+    private val _downloadProgress = MutableStateFlow<Pair<Long, Long>?>(null)
+    val downloadProgress: StateFlow<Pair<Long, Long>?> = _downloadProgress
+
     // 内部状態
     private var monitorJob: Job? = null
     private var feedId: String = GtfsRepository.DEFAULT_FEED_ID
     private var stopId: String? = null
     private var tripUpdateUrl: String = "https://km.bus-vision.jp/realtime/sankobus_trip_update.bin"
+
+    // 監視対象の停留所 ID (複数可, 乗車停留所)
+    private val monitoredStopIds = mutableSetOf<String>()
+
+    fun setMonitoredStops(stopIds: Set<String>) {
+        monitoredStopIds.clear()
+        monitoredStopIds.addAll(stopIds)
+    }
+
+    fun monitoredStopIds(): Set<String> = monitoredStopIds.toSet()
+
+    // 監視対象の経路 (乗車停留所 -> 降車停留所)
+    private val monitoredRoutes = mutableSetOf<Pair<String, String>>()
+
+    fun setMonitoredRoutes(routes: Set<Pair<String, String>>) {
+        monitoredRoutes.clear()
+        monitoredRoutes.addAll(routes)
+    }
+
+    fun monitoredRoutes(): Set<Pair<String, String>> = monitoredRoutes.toSet()
 
     // Retry-After 期限 (elapsedRealtime ベース)
     @Volatile
@@ -127,6 +195,8 @@ class RealtimeUpdateController(
 
     fun stop() {
         _isRunning.value = false
+        _isWaiting.value = false
+        _nextResumeEpochMs.value = 0L
         monitorJob?.cancel()
         monitorJob = null
         stopNetworkMonitoring()
@@ -141,9 +211,81 @@ class RealtimeUpdateController(
                 continue
             }
 
+            // 運行時間外チェック: 取得前に判定し、通信自体を回避します。
+            // キャッシュされた予測が空 (初回) の場合は通常取得を行います。
+            val pauseEnabled = isPauseWhenNoActive(context)
+            if (pauseEnabled) {
+                val monitored = monitoredStopIds()
+                val cached = _latestPredictions.value
+                if (cached.isNotEmpty()) {
+                    val nowEpoch = System.currentTimeMillis() / 1000
+                    val nearFutureSec = 2 * 60 * 60L
+                    val recentPastSec = 30 * 60L
+                    val routes = monitoredRoutes()
+                    val hasActiveBus = if (routes.isNotEmpty()) {
+                        // 経路 (乗車->降車) を考慮: 降車停留所を経由する便のみを「走行中」とみなす
+                        routes.any { (origin, dest) ->
+                            val common = commonTripsForRoute(origin, dest)
+                            cached.any { pred ->
+                                if (GtfsRepository.baseStopId(pred.stopId) != GtfsRepository.baseStopId(origin)) return@any false
+                                if (common != null && common.isNotEmpty() && pred.tripId !in common) return@any false
+                                val pa = pred.predictedArrivalEpoch
+                                if (pa == null) return@any true
+                                pa in (nowEpoch - recentPastSec)..(nowEpoch + nearFutureSec)
+                            }
+                        }
+                    } else {
+                        // 経路情報がない場合は乗車停留所ベース (後方互換)
+                        monitored.any { mid ->
+                            cached.any { pred ->
+                                if (GtfsRepository.baseStopId(pred.stopId) != GtfsRepository.baseStopId(mid)) return@any false
+                                val pa = pred.predictedArrivalEpoch
+                                if (pa == null) return@any true
+                                pa in (nowEpoch - recentPastSec)..(nowEpoch + nearFutureSec)
+                            }
+                        }
+                    }
+                    if (!hasActiveBus) {
+                        val nextDeparture = findNextDepartureEpoch()
+                        if (nextDeparture != null) {
+                            val msUntilDeparture = nextDeparture - System.currentTimeMillis()
+                            // 次の便の出発まで 5 分以上ある場合のみ一時停止し、
+                            // 出発 5 分前から取得を再開する。近い場合は通常取得を行う
+                            // (0 待機での連続取得ループを防ぐ)。
+                            if (msUntilDeparture > 6 * 60 * 1000L) {
+                                val resumeAt = nextDeparture - 5 * 60 * 1000L
+                                val waitMs = (resumeAt - System.currentTimeMillis())
+                                    .coerceIn(60_000L, 30 * 60 * 1000L)
+                                _isWaiting.value = true
+                                _nextResumeEpochMs.value = resumeAt
+                                Log.w(TAG, "Pause: no active bus on monitored routes, waiting ${waitMs}ms (nextDeparture=$nextDeparture)")
+                                if (waitMs > 0) {
+                                    delay(waitMs)
+                                }
+                                _isWaiting.value = false
+                                _nextResumeEpochMs.value = 0L
+                                continue
+                            }
+                        } else {
+                            Log.w(TAG, "Pause: no active bus, nextDeparture unknown, waiting 30min")
+                            _isWaiting.value = true
+                            _nextResumeEpochMs.value = System.currentTimeMillis() + 30 * 60 * 1000L
+                            delay(30 * 60 * 1000L)
+                            _isWaiting.value = false
+                            _nextResumeEpochMs.value = 0L
+                            continue
+                        }
+                    }
+                }
+            }
+
             val startTime = SystemClock.elapsedRealtime()
+            _downloadProgress.value = 0L to 0L
+            var result: FetchResult? = null
             try {
-                val result = repository.fetch(feedId, tripUpdateUrl)
+                result = repository.fetch(feedId, tripUpdateUrl) { downloaded, total ->
+                    _downloadProgress.value = downloaded to total
+                }
                 when (result) {
                     is FetchResult.Success -> {
                         _latestPredictions.value = result.predictions
@@ -183,6 +325,7 @@ class RealtimeUpdateController(
                 _lastError.value = e.message
                 _lastErrorType.value = FetchErrorType.NETWORK_ERROR
             } finally {
+                _downloadProgress.value = null
                 val duration = SystemClock.elapsedRealtime() - startTime
                 _lastDurationMs.value = duration
             }
@@ -192,7 +335,10 @@ class RealtimeUpdateController(
             val elapsed = SystemClock.elapsedRealtime() - startTime
             val normalWait = (intervalMs - elapsed).coerceAtLeast(0)
             val retryWait = (retryAfterDeadline - SystemClock.elapsedRealtime()).coerceAtLeast(0)
-            val waitTime = maxOf(normalWait, retryWait)
+            var waitTime = maxOf(normalWait, retryWait)
+
+            // (運行時間外チェックは取得前に実施済み)
+
             if (waitTime > 0) {
                 delay(waitTime)
             }
@@ -279,6 +425,110 @@ class RealtimeUpdateController(
         }
         networkCallback = null
         connectivityManager = null
+    }
+
+    /**
+     * 監視対象の停留所の次の出発時刻 (epoch ms) を取得します。
+     * 静的 GTFS の stop_times と calendar から計算します。
+     */
+    /**
+     * 指定経路 (乗車 -> 降車) を経由する便の tripId セットを返します。
+     * 降車 == 乗車 の場合は null (フィルタなし)。
+     */
+    private suspend fun commonTripsForRoute(originStopId: String, destStopId: String): Set<String>? {
+        if (GtfsRepository.baseStopId(originStopId) == GtfsRepository.baseStopId(destStopId)) return null
+        val baseId = GtfsRepository.baseStopId(originStopId)
+        val destBase = GtfsRepository.baseStopId(destStopId)
+        val allStops = database.stopDao().getAll(feedId)
+        val originVariants = allStops.filter { GtfsRepository.baseStopId(it.stopId) == baseId }.map { it.stopId }.toSet()
+        val destVariants = allStops.filter { GtfsRepository.baseStopId(it.stopId) == destBase }.map { it.stopId }.toSet()
+        val effectiveOrigin = if (originVariants.isEmpty()) setOf(originStopId) else originVariants
+        val effectiveDest = if (destVariants.isEmpty()) setOf(destStopId) else destVariants
+        val originStopTimes = effectiveOrigin.flatMap { database.stopTimeDao().getByStop(feedId, it) }
+        val destStopTimes = effectiveDest.flatMap { database.stopTimeDao().getByStop(feedId, it) }
+        val originByTrip = originStopTimes.groupBy { it.tripId }
+        return destStopTimes.filter { dst ->
+            val originSts = originByTrip[dst.tripId] ?: return@filter false
+            originSts.any { it.stopSequence < dst.stopSequence }
+        }.map { it.tripId }.toSet()
+    }
+
+    private suspend fun findNextDepartureEpoch(): Long? {
+        if (monitoredStopIds.isEmpty()) return null
+        val tz = java.util.TimeZone.getTimeZone("Asia/Tokyo")
+        val now = System.currentTimeMillis()
+        val sdf = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault()).apply {
+            timeZone = tz
+        }
+
+        var nextDeparture: Long? = null
+
+        // 今日から 7 日先まで走査して、最初の運行日・便の出発時刻を求めます
+        for (dayOffset in 0..6) {
+            val dayCal = java.util.Calendar.getInstance(tz).apply {
+                timeInMillis = now
+                add(java.util.Calendar.DAY_OF_MONTH, dayOffset)
+                set(java.util.Calendar.HOUR_OF_DAY, 0)
+                set(java.util.Calendar.MINUTE, 0)
+                set(java.util.Calendar.SECOND, 0)
+                set(java.util.Calendar.MILLISECOND, 0)
+            }
+            val dayStr = sdf.format(java.util.Date(dayCal.timeInMillis))
+            val midnight = dayCal.timeInMillis
+
+            for (stopId in monitoredStopIds) {
+                val baseId = GtfsRepository.baseStopId(stopId)
+                val allStops = database.stopDao().getAll(feedId)
+                val variants = allStops.filter { GtfsRepository.baseStopId(it.stopId) == baseId }
+                val stopTimes = variants.flatMap { v ->
+                    database.stopTimeDao().getByStop(feedId, v.stopId)
+                }
+
+                for (st in stopTimes) {
+                    val trip = database.tripDao().get(feedId, st.tripId) ?: continue
+                    val cal = database.calendarDao().getCalendar(feedId, trip.serviceId)
+                    // サービス日チェック
+                    val isActive = if (cal != null) {
+                        val dayOfWeek = dayCal.get(java.util.Calendar.DAY_OF_WEEK)
+                        val dayFlag = when (dayOfWeek) {
+                            java.util.Calendar.MONDAY -> cal.monday
+                            java.util.Calendar.TUESDAY -> cal.tuesday
+                            java.util.Calendar.WEDNESDAY -> cal.wednesday
+                            java.util.Calendar.THURSDAY -> cal.thursday
+                            java.util.Calendar.FRIDAY -> cal.friday
+                            java.util.Calendar.SATURDAY -> cal.saturday
+                            java.util.Calendar.SUNDAY -> cal.sunday
+                            else -> 0
+                        }
+                        dayFlag == 1 && dayStr >= cal.startDate && dayStr <= cal.endDate
+                    } else {
+                        val dates = database.calendarDao().getCalendarDates(feedId, trip.serviceId)
+                        dates.any { it.date == dayStr && it.exceptionType == 1 }
+                    }
+                    if (!isActive) continue
+
+                    val depTime = st.departureTime ?: st.arrivalTime ?: continue
+                    val parts = depTime.split(":")
+                    if (parts.size != 3) continue
+                    val h = parts[0].toLongOrNull() ?: continue
+                    val m = parts[1].toLongOrNull() ?: continue
+                    val s = parts[2].toLongOrNull() ?: continue
+                    val seconds = h * 3600 + m * 60 + s
+
+                    var depEpoch = midnight + seconds * 1000
+                    // 24h+ の場合
+                    if (seconds >= 86400) {
+                        depEpoch = midnight + (seconds - 86400) * 1000 + 86400 * 1000
+                    }
+
+                    if (depEpoch > now && (nextDeparture == null || depEpoch < nextDeparture)) {
+                        nextDeparture = depEpoch
+                    }
+                }
+            }
+        }
+
+        return nextDeparture
     }
 }
 
