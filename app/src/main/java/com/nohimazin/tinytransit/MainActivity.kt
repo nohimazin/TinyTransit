@@ -192,7 +192,18 @@ fun MainScreen(
                 } else {
                     result
                 }
-                allPredictions["${route.originStopId}->${route.destStopId}"] = filtered
+
+                if (filtered.isEmpty()) {
+                    // GTFS-RT に該当便がない → 静的時刻表にフォールバック
+                    val staticArrivals = realtimeRepository.getStaticArrivalsForStop(
+                        feedId = GtfsRepository.DEFAULT_FEED_ID,
+                        originStopId = route.originStopId,
+                        destStopId = route.destStopId
+                    )
+                    allPredictions["${route.originStopId}->${route.destStopId}"] = staticArrivals
+                } else {
+                    allPredictions["${route.originStopId}->${route.destStopId}"] = filtered
+                }
             }
             homeArrivals = allPredictions
             homeStatus = "到着予測: ${homeArrivals.values.sumOf { it.size }} 件"
@@ -255,8 +266,25 @@ fun MainScreen(
             } else {
                 result
             }
-            arrivals = filtered
-            arrivalStatus = "到着予測: ${arrivals.size} 件" + if (selectedDest != null) " (${selectedDest!!.stopName} 行き)" else ""
+            if (filtered.isEmpty()) {
+                arrivalStatus = "リアルタイム情報なし (時刻表ベース)"
+                try {
+                    val staticArrivals = realtimeRepository.getStaticArrivalsForStop(
+                        feedId = GtfsRepository.DEFAULT_FEED_ID,
+                        originStopId = origin.stopId,
+                        destStopId = selectedDest?.stopId
+                    )
+                    arrivals = staticArrivals
+                    if (staticArrivals.isEmpty()) {
+                        arrivalStatus = "リアルタイム情報なし (時刻表データもなし)"
+                    }
+                } catch (e: Exception) {
+                    arrivalStatus = "リアルタイム情報なし (時刻表エラー: ${e.message})"
+                }
+            } else {
+                arrivals = filtered
+                arrivalStatus = "到着予測: ${arrivals.size} 件" + if (selectedDest != null) " (${selectedDest!!.stopName} 行き)" else ""
+            }
         } catch (e: Exception) {
             arrivalStatus = "エラー: ${e.message}"
         } finally {

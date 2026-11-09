@@ -54,6 +54,8 @@ data class ArrivalPrediction(
     fun delayText(): String {
         if (isCanceled) return "運休"
         if (isSkipped) return "通過"
+        // 静的時刻表ベースの場合は遅延不明
+        if (!isRealtime) return "不明"
         val d = delaySeconds ?: computeDelay() ?: return "定刻"
         return when {
             d == 0 -> "定刻"

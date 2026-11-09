@@ -101,6 +101,13 @@ class RealtimeUpdateController(
         GtfsRealtimeRepository(context, database, httpClient)
     }
 
+    /**
+     * 静的 GTFS の時刻表から到着予定を取得します (フォールバック用)。
+     */
+    suspend fun getStaticArrivals(feedId: String, originStopId: String, destStopId: String?): List<StopArrival> {
+        return repository.getStaticArrivalsForStop(feedId, originStopId, destStopId)
+    }
+
     fun configure(feedId: String, stopId: String?, tripUpdateUrl: String) {
         this.feedId = feedId
         this.stopId = stopId

@@ -164,7 +164,9 @@ class RealtimeMonitorService : Service() {
     private suspend fun refreshNotification(controller: RealtimeUpdateController) {
         val predictions = controller.latestPredictions.value
         val nowEpoch = System.currentTimeMillis() / 1000
-        val lastUpdate = controller.lastUpdateEpoch.value
+        // GTFS-RT のフィード/便タイムスタンプを使用 (アプリの取得時刻ではない)
+        val feedTimestamp = controller.latestPredictions.value.firstOrNull()?.tripUpdateTimestamp
+            ?: controller.latestPredictions.value.firstOrNull()?.feedTimestamp
 
         // 各監視経路ごとに個別の通知を更新
         for (routeKey in monitoredRoutes) {
@@ -180,13 +182,70 @@ class RealtimeMonitorService : Service() {
                     pred >= nowEpoch - 60
                 }
 
+            // 降車停留所を経由する便のみ (origin != dest の場合)
+            if (destStopId != originStopId) {
+                val destBaseId = GtfsRepository.baseStopId(destStopId)
+                val allStops = try {
+                    (application as TinyTransitApp).database.stopDao().getAll(GtfsRepository.DEFAULT_FEED_ID)
+                } catch (e: Exception) {
+                    emptyList()
+                }
+                val destVariantIds = allStops.filter { GtfsRepository.baseStopId(it.stopId) == destBaseId }
+                    .map { it.stopId }.toSet()
+                val effectiveDestIds = if (destVariantIds.isEmpty()) setOf(destStopId) else destVariantIds
+
+                val commonTrips = try {
+                    val destStopTimes = effectiveDestIds.flatMap { v ->
+                        (application as TinyTransitApp).database.stopTimeDao()
+                            .getByStop(GtfsRepository.DEFAULT_FEED_ID, v)
+                    }
+                    // 基底 ID の全方向の停留所から origin の stop_times を取得
+                    val allStops = (application as TinyTransitApp).database.stopDao()
+                        .getAll(GtfsRepository.DEFAULT_FEED_ID)
+                    val originVariantIds = allStops.filter { GtfsRepository.baseStopId(it.stopId) == baseId }
+                        .map { it.stopId }.toSet()
+                    val effectiveOriginIds = if (originVariantIds.isEmpty()) setOf(originStopId) else originVariantIds
+                    val originStopTimes = effectiveOriginIds.flatMap { v ->
+                        (application as TinyTransitApp).database.stopTimeDao()
+                            .getByStop(GtfsRepository.DEFAULT_FEED_ID, v)
+                    }
+                    // 同一 trip が同じ停留所を複数回経由する場合、最小の stopSequence を使用
+                    val originSeqMap = originStopTimes.groupBy { it.tripId }
+                        .mapValues { (_, sts) -> sts.minOf { it.stopSequence } }
+                    destStopTimes.filter { dst ->
+                        val originSeq = originSeqMap[dst.tripId]
+                        originSeq != null && originSeq < dst.stopSequence
+                    }.map { it.tripId }.toSet()
+                } catch (e: Exception) {
+                    emptySet()
+                }
+                // commonTrips が空でない場合のみフィルタ (空の場合はフィルタしない)
+                if (commonTrips.isNotEmpty()) {
+                    filtered = filtered.filter { it.tripId in commonTrips }
+                }
+
+                // GTFS-RT に該当便がない場合 → 静的時刻表にフォールバック
+                if (filtered.isEmpty()) {
+                    val staticArrivals = try {
+                        controller?.getStaticArrivals(GtfsRepository.DEFAULT_FEED_ID, originStopId, destStopId)
+                            ?.map { it.prediction } ?: emptyList()
+                    } catch (e: Exception) {
+                        emptyList()
+                    }
+                    if (staticArrivals.isNotEmpty()) {
+                        filtered = staticArrivals
+                    }
+                }
+            }
+
             // 選択された便がある場合はそれのみ
             // 選択フィルタリングは行わない (全便を表示)
 
             val notificationId = routeNotificationIds.getOrPut(routeKey) {
                 NOTIFICATION_ID_BASE + routeKey.hashCode().and(0x7FFFFFFF) % 1000
             }
-            updateRouteNotification(notificationId, routeName, filtered, lastUpdate)
+            val feedTimestampMs = feedTimestamp?.let { it * 1000 }
+            updateRouteNotification(notificationId, routeName, filtered, feedTimestampMs)
         }
     }
 
@@ -275,6 +334,9 @@ class RealtimeMonitorService : Service() {
                 sb.append("\n遅延: $delay")
                 if (minsText.isNotEmpty()) {
                     sb.append("  $minsText")
+                }
+                if (!nearest.isRealtime) {
+                    sb.append(" (時刻表)")
                 }
             }
         }
@@ -432,10 +494,12 @@ class RealtimeMonitorService : Service() {
             sdf.timeZone = java.util.TimeZone.getTimeZone("Asia/Tokyo")
             sdf.format(java.util.Date(tripTimestamp * 1000))
         } else ""
+        val isStatic = nearest.isRealtime == false
+        val staticSuffix = if (isStatic) " (時刻表)" else ""
         return if (timeText.isNotEmpty()) {
-            "$minsText・$delay・${timeText}時点"
+            "$minsText・$delay・${timeText}時点$staticSuffix"
         } else {
-            "$minsText・$delay"
+            "$minsText・$delay$staticSuffix"
         }
     }
 

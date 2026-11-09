@@ -342,74 +342,23 @@ class GtfsRepository(
         val originVariants = getStopVariants(feedId, originBase).map { it.stopId }.toSet()
         val destVariants = getStopVariants(feedId, destBase).map { it.stopId }.toSet()
 
-        // 乗車停留所の stop_times から trip_id を取得
-        val originTrips = originVariants.flatMap { v ->
+        // 降車停留所の stop_times
+        val destStopTimes = destVariants.flatMap { v ->
             database.stopTimeDao().getByStop(feedId, v)
+        }
+
+        // 乗車停留所の stop_times (最小 stop_sequence を使用)
+        val originStopTimes = originVariants.flatMap { v ->
+            database.stopTimeDao().getByStop(feedId, v)
+        }
+        val originSeqMap = originStopTimes.groupBy { it.tripId }
+            .mapValues { (_, sts) -> sts.minOf { it.stopSequence } }
+
+        // 両方を経由し、乗車 → 降車の順で停車する便のみ
+        destStopTimes.filter { dst ->
+            val originSeq = originSeqMap[dst.tripId]
+            originSeq != null && originSeq < dst.stopSequence
         }.map { it.tripId }.distinct()
-
-        // 降車停留所の stop_times から trip_id を取得
-        val destTrips = destVariants.flatMap { v ->
-            database.stopTimeDao().getByStop(feedId, v)
-        }.map { it.tripId }.toSet()
-
-        // 両方を経由する便
-        originTrips.filter { it in destTrips }
-    }
-
-    /**
-     * 指定された日付 (YYYYMMDD) にサービスが有効かどうかを判定します。
-     */
-    suspend fun isServiceActive(feedId: String, serviceId: String, date: String): Boolean =
-        withContext(Dispatchers.IO) {
-            val cal = database.calendarDao().getCalendar(feedId, serviceId)
-            val dates = database.calendarDao().getCalendarDates(feedId, serviceId)
-
-            // calendar_dates で例外処理
-            val exception = dates.firstOrNull { it.date == date }
-            if (exception != null) {
-                return@withContext exception.exceptionType == 1 // 1 = 追加
-            }
-
-            // calendar がない場合は false
-            if (cal == null) return@withContext false
-
-            // 日付範囲チェック
-            if (date < cal.startDate || date > cal.endDate) return@withContext false
-
-            // 曜日チェック
-            val dayOfWeek = getDayOfWeek(date)
-            when (dayOfWeek) {
-                1 -> cal.monday == 1  // Monday (GTFS: 1=Monday)
-                2 -> cal.tuesday == 1
-                3 -> cal.wednesday == 1
-                4 -> cal.thursday == 1
-                5 -> cal.friday == 1
-                6 -> cal.saturday == 1
-                7 -> cal.sunday == 1
-                else -> false
-            }
-        }
-
-    private fun getDayOfWeek(date: String): Int {
-        // date: YYYYMMDD
-        val y = date.substring(0, 4).toInt()
-        val m = date.substring(4, 6).toInt()
-        val d = date.substring(6, 8).toInt()
-        val cal = java.util.Calendar.getInstance()
-        cal.set(y, m - 1, d)
-        // Calendar: SUNDAY=1, MONDAY=2, ... SATURDAY=7
-        // GTFS: monday=1, ..., sunday=7
-        val dow = cal.get(java.util.Calendar.DAY_OF_WEEK)
-        return when (dow) {
-            java.util.Calendar.MONDAY -> 1
-            java.util.Calendar.TUESDAY -> 2
-            java.util.Calendar.WEDNESDAY -> 3
-            java.util.Calendar.THURSDAY -> 4
-            java.util.Calendar.FRIDAY -> 5
-            java.util.Calendar.SATURDAY -> 6
-            java.util.Calendar.SUNDAY -> 7
-            else -> 0
-        }
     }
 
     /**
