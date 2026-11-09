@@ -117,8 +117,8 @@ fun MainScreen(
     var updateTrigger by remember { mutableStateOf(0) }
     var selectedTripId by remember { mutableStateOf<String?>(null) }
 
-    // バックグラウンド監視
-    var monitoring by remember { mutableStateOf(RealtimeMonitorService.isRunning) }
+    // バックグラウンド監視 (経路ごとに管理)
+    var monitoringRouteKeys by remember { mutableStateOf<Set<String>>(emptySet()) }
     var networkStateText by remember { mutableStateOf("") }
 
     LaunchedEffect(Unit) {
@@ -266,7 +266,9 @@ fun MainScreen(
 
     LaunchedEffect(Unit) {
         while (true) {
-            monitoring = RealtimeMonitorService.isRunning
+            if (!RealtimeMonitorService.isRunning) {
+                monitoringRouteKeys = emptySet()
+            }
             val cm = context.getSystemService(android.content.Context.CONNECTIVITY_SERVICE) as android.net.ConnectivityManager
             val network = cm.activeNetwork
             val caps = network?.let { cm.getNetworkCapabilities(it) }
@@ -458,7 +460,7 @@ fun MainScreen(
                         }
                     }
                     Text(text = "停留所: ${a.stopName ?: GtfsRepository.baseStopId(a.prediction.stopId)}")
-                    Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
+                    Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}${if (!a.prediction.isRealtime) " (時刻表)" else ""}")
                     val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
                     if (mins != null) {
                         Text(text = "あと ${mins} 分")
@@ -477,22 +479,62 @@ fun MainScreen(
                 }
             } else {
                 items(monitoredRoutes) { route ->
+                    val routeKey = "${route.originStopId}->${route.destStopId}"
+                    val isMonitoringThis = routeKey in monitoringRouteKeys
                     Column(modifier = Modifier.fillMaxWidth().padding(vertical = 8.dp)) {
                         Text(text = "${route.originStopName} → ${route.destStopName}")
-                        Button(
-                            onClick = {
-                                val app = context.applicationContext as TinyTransitApp
-                                kotlinx.coroutines.GlobalScope.launch {
-                                    app.database.monitoredRouteDao().deleteByRoute(
-                                        GtfsRepository.DEFAULT_FEED_ID,
-                                        route.originStopId,
-                                        route.destStopId
-                                    )
-                                    monitoredRoutes = app.database.monitoredRouteDao().getAll(GtfsRepository.DEFAULT_FEED_ID)
-                                }
-                            }
+                        Row(
+                            modifier = Modifier.fillMaxWidth().padding(top = 4.dp),
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
                         ) {
-                            Text("削除")
+                            Button(
+                                onClick = {
+                                    if (isMonitoringThis) {
+                                        val intent = Intent(context, RealtimeMonitorService::class.java).apply {
+                                            action = RealtimeMonitorService.ACTION_REMOVE_ROUTE
+                                            putExtra(RealtimeMonitorService.EXTRA_ORIGIN_STOP_ID, route.originStopId)
+                                            putExtra(RealtimeMonitorService.EXTRA_DEST_STOP_ID, route.destStopId)
+                                        }
+                                        context.startService(intent)
+                                        monitoringRouteKeys = monitoringRouteKeys - routeKey
+                                    } else {
+                                        if (!activity.hasNotificationPermission()) {
+                                            activity.requestNotificationPermission()
+                                            return@Button
+                                        }
+                                        val intent = Intent(context, RealtimeMonitorService::class.java).apply {
+                                            action = RealtimeMonitorService.ACTION_ADD_ROUTE
+                                            putExtra(RealtimeMonitorService.EXTRA_ORIGIN_STOP_ID, route.originStopId)
+                                            putExtra(RealtimeMonitorService.EXTRA_ORIGIN_STOP_NAME, route.originStopName)
+                                            putExtra(RealtimeMonitorService.EXTRA_DEST_STOP_ID, route.destStopId)
+                                            putExtra(RealtimeMonitorService.EXTRA_DEST_STOP_NAME, route.destStopName)
+                                        }
+                                        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                            context.startForegroundService(intent)
+                                        } else {
+                                            context.startService(intent)
+                                        }
+                                        monitoringRouteKeys = monitoringRouteKeys + routeKey
+                                    }
+                                }
+                            ) {
+                                Text(if (isMonitoringThis) "監視停止" else "監視開始")
+                            }
+                            Button(
+                                onClick = {
+                                    val app = context.applicationContext as TinyTransitApp
+                                    kotlinx.coroutines.GlobalScope.launch {
+                                        app.database.monitoredRouteDao().deleteByRoute(
+                                            GtfsRepository.DEFAULT_FEED_ID,
+                                            route.originStopId,
+                                            route.destStopId
+                                        )
+                                        monitoredRoutes = app.database.monitoredRouteDao().getAll(GtfsRepository.DEFAULT_FEED_ID)
+                                    }
+                                }
+                            ) {
+                                Text("削除")
+                            }
                         }
                     }
                 }
@@ -509,7 +551,7 @@ fun MainScreen(
                     items(routeArrivals) { a ->
                         Column(modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp)) {
                             Text(text = "${a.routeShortName ?: ""} ${a.routeLongName ?: ""} → ${a.tripHeadsign ?: ""}")
-                            Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}")
+                            Text(text = "予定: ${formatSeconds(a.prediction.scheduledArrivalSeconds)}  予測: ${a.prediction.predictedTimeText()}  ${a.prediction.delayText()}${if (!a.prediction.isRealtime) " (時刻表)" else ""}")
                             val mins = a.prediction.minutesUntil(System.currentTimeMillis() / 1000)
                             if (mins != null) {
                                 Text(text = "あと ${mins} 分")
@@ -547,45 +589,9 @@ fun MainScreen(
                 }
             }
 
-            // バックグラウンド監視
+            // ネットワーク状態
             item {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(top = 8.dp),
-                    verticalAlignment = Alignment.CenterVertically
-                ) {
-                    Text(text = "監視: ${if (monitoring) "ON" else "OFF"}")
-                    Button(
-                        onClick = {
-                            if (monitoring) {
-                                val intent = Intent(context, RealtimeMonitorService::class.java).apply {
-                                    action = RealtimeMonitorService.ACTION_STOP
-                                }
-                                context.startService(intent)
-                                monitoring = false
-                            } else {
-                                if (!activity.hasNotificationPermission()) {
-                                    activity.requestNotificationPermission()
-                                    return@Button
-                                }
-                                val ms = monitoredRoutes.firstOrNull() ?: return@Button
-                                val intent = Intent(context, RealtimeMonitorService::class.java).apply {
-                                    putExtra(RealtimeMonitorService.EXTRA_FEED_ID, GtfsRepository.DEFAULT_FEED_ID)
-                                    putExtra(RealtimeMonitorService.EXTRA_STOP_ID, ms.originStopId)
-                                    putExtra(RealtimeMonitorService.EXTRA_STOP_NAME, ms.originStopName)
-                                }
-                                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                                    context.startForegroundService(intent)
-                                } else {
-                                    context.startService(intent)
-                                }
-                                monitoring = true
-                            }
-                        },
-                        modifier = Modifier.padding(start = 8.dp)
-                    ) {
-                        Text(if (monitoring) "監視停止" else "監視開始")
-                    }
-                }
+                Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))
             }
 
             // Network state

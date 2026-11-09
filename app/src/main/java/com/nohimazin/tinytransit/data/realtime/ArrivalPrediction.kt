@@ -22,7 +22,8 @@ data class ArrivalPrediction(
     val isCanceled: Boolean,
     val feedTimestamp: Long?,
     val tripUpdateTimestamp: Long? = null,
-    val agencyTimezone: String? = null
+    val agencyTimezone: String? = null,
+    val isRealtime: Boolean = true
 ) {
     /**
      * 予測到着時刻のエポック秒を返します。

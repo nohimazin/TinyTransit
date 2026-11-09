@@ -267,6 +267,50 @@ class GtfsRealtimeRepository(
         return parseGtfsTimeToSeconds(timeStr)
     }
 
+    private fun getServiceDayStartEpoch(timezone: String, scheduledSeconds: Long): Long {
+        val tz = java.util.TimeZone.getTimeZone(timezone)
+        val cal = java.util.Calendar.getInstance(tz)
+        // 現在時刻を agency tz で取得
+        val now = System.currentTimeMillis()
+        cal.timeInMillis = now
+        // 今日の 0:00 (midnight) を計算
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis / 1000
+    }
+
+    private fun getDayOfWeek(date: String): Int {
+        val y = date.substring(0, 4).toInt()
+        val m = date.substring(4, 6).toInt()
+        val d = date.substring(6, 8).toInt()
+        val cal = java.util.Calendar.getInstance()
+        cal.set(y, m - 1, d)
+        val dow = cal.get(java.util.Calendar.DAY_OF_WEEK)
+        return when (dow) {
+            java.util.Calendar.MONDAY -> 1
+            java.util.Calendar.TUESDAY -> 2
+            java.util.Calendar.WEDNESDAY -> 3
+            java.util.Calendar.THURSDAY -> 4
+            java.util.Calendar.FRIDAY -> 5
+            java.util.Calendar.SATURDAY -> 6
+            java.util.Calendar.SUNDAY -> 7
+            else -> 0
+        }
+    }
+
+    private fun getServiceDayStartEpoch(timezone: String, scheduledSeconds: Long): Long {
+        val tz = java.util.TimeZone.getTimeZone(timezone)
+        val cal = java.util.Calendar.getInstance(tz)
+        cal.timeInMillis = System.currentTimeMillis()
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal.timeInMillis / 1000
+    }
+
     private fun parseGtfsTimeToSeconds(time: String): Long? {
         val parts = time.split(":")
         if (parts.size != 3) return null
@@ -321,7 +365,72 @@ class GtfsRealtimeRepository(
         val routeMap = database.routeDao().getAll(feedId).associateBy { it.routeId }
 
         val nowEpoch = System.currentTimeMillis() / 1000
-        predictions.filter { it.stopId in effectiveIds }
+        val agencyTz = database.feedDao().get(feedId)?.agencyTimezone ?: "Asia/Tokyo"
+        // スケジュール済みだがリアルタイム予測がない便を補完
+        val realtimeTripIds = predictions.map { it.tripId }.toSet()
+        val today = java.text.SimpleDateFormat("yyyyMMdd", java.util.Locale.getDefault()).apply {
+            timeZone = java.util.TimeZone.getTimeZone(agencyTz)
+        }.format(java.util.Date())
+        val stopTimeEntries = effectiveIds.flatMap { sid ->
+            database.stopTimeDao().getByStop(feedId, sid)
+        }
+        val scheduledOnly = mutableListOf<ArrivalPrediction>()
+        for (tripId in stopTimeEntries.map { it.tripId }.distinct()) {
+            if (tripId in realtimeTripIds) continue
+            val trip = database.tripDao().get(feedId, tripId) ?: continue
+            // isServiceActive のインライン実装
+            val cal = database.calendarDao().getCalendar(feedId, trip.serviceId)
+            val calDates = database.calendarDao().getCalendarDates(feedId, trip.serviceId)
+            val exception = calDates.firstOrNull { it.date == today }
+            val isActive = if (exception != null) {
+                exception.exceptionType == 1
+            } else if (cal == null) {
+                false
+            } else if (today < cal.startDate || today > cal.endDate) {
+                false
+            } else {
+                val dow = getDayOfWeek(today)
+                when (dow) {
+                    1 -> cal.monday == 1
+                    2 -> cal.tuesday == 1
+                    3 -> cal.wednesday == 1
+                    4 -> cal.thursday == 1
+                    5 -> cal.friday == 1
+                    6 -> cal.saturday == 1
+                    7 -> cal.sunday == 1
+                    else -> false
+                }
+            }
+            if (!isActive) continue
+            val stopTime = stopTimeEntries.firstOrNull { it.tripId == tripId } ?: continue
+            val arrivalTimeStr = stopTime.arrivalTime ?: stopTime.departureTime ?: continue
+            val scheduledSeconds = parseGtfsTimeToSeconds(arrivalTimeStr) ?: continue
+            val serviceDayStart = getServiceDayStartEpoch(agencyTz, scheduledSeconds)
+            val predictedEpoch = serviceDayStart + scheduledSeconds
+            if (predictedEpoch < nowEpoch - 60) continue
+            scheduledOnly.add(
+                ArrivalPrediction(
+                    feedId = feedId,
+                    tripId = tripId,
+                    routeId = trip.routeId,
+                    stopId = stopTime.stopId,
+                    stopSequence = stopTime.stopSequence,
+                    scheduledArrivalSeconds = scheduledSeconds,
+                    predictedArrivalEpoch = predictedEpoch,
+                    delaySeconds = 0,
+                    isSkipped = false,
+                    isCanceled = false,
+                    feedTimestamp = null,
+                    tripUpdateTimestamp = null,
+                    agencyTimezone = agencyTz,
+                    isRealtime = false
+                )
+            )
+        }
+
+        val allPredictions = predictions.filter { it.stopId in effectiveIds } + scheduledOnly
+
+        allPredictions
             // 過去の便を除外（予測到着時刻が現在より前のものは表示しない）
             .filter { p ->
                 val pred = p.predictedArrivalEpoch ?: return@filter true
