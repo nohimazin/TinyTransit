@@ -214,32 +214,12 @@ class GtfsRepository(
         val request = Request.Builder().url(url).build()
         httpClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
-            response.body!!.byteStream().use { input ->
-                dest.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            }
+            val body = response.body ?: throw IllegalStateException("Empty response body")
+            downloadToFile(body.byteStream(), body.contentLength(), dest, MAX_DOWNLOAD_SIZE_BYTES)
         }
     }
 
-    private fun unzip(zipFile: File, destDir: File) {
-        ZipInputStream(zipFile.inputStream()).use { zis ->
-            var entry = zis.nextEntry
-            while (entry != null) {
-                val outFile = File(destDir, entry.name)
-                if (entry.isDirectory) {
-                    outFile.mkdirs()
-                } else {
-                    outFile.parentFile?.mkdirs()
-                    outFile.outputStream().use { output ->
-                        zis.copyTo(output)
-                    }
-                }
-                zis.closeEntry()
-                entry = zis.nextEntry
-            }
-        }
-    }
+
 
     private fun readCsvFile(dir: File, name: String): String {
         val f = File(dir, name)
@@ -247,6 +227,198 @@ class GtfsRepository(
     }
 
     companion object {
+        const val MAX_DOWNLOAD_SIZE_BYTES = 200L * 1024 * 1024  // 200 MB (産交バス GTFS ZIP は ~6 MB)
+
+        /**
+         * ストリーミングでファイルをダウンロードし、サイズ制限を適用します。
+         *
+         * - contentLength が既知で上限を超える場合は事前に拒否
+         * - 実際の受信バイト数を累積して上限を検証
+         * - 上限超過時は部分ファイルを削除
+         * - Content-Length と実際の受信量が不一致の場合は拒否
+         * - メモリに一括読み込みしない (8KB バッファでストリーミング)
+         */
+        internal fun downloadToFile(
+            input: java.io.InputStream,
+            contentLength: Long,
+            dest: File,
+            maxSizeBytes: Long = MAX_DOWNLOAD_SIZE_BYTES
+        ) {
+            try {
+                if (contentLength >= 0 && contentLength > maxSizeBytes) {
+                    throw IllegalStateException("Download exceeds size limit: $contentLength > $maxSizeBytes")
+                }
+                dest.outputStream().use { output ->
+                    val buf = ByteArray(8192)
+                    var total = 0L
+                    while (true) {
+                        val read = input.read(buf)
+                        if (read == -1) break
+                        if (total + read > maxSizeBytes) {
+                            throw IllegalStateException("Download exceeds size limit")
+                        }
+                        output.write(buf, 0, read)
+                        total += read
+                    }
+                    if (contentLength >= 0 && total != contentLength) {
+                        throw IllegalStateException(
+                            "Download size mismatch: expected $contentLength, got $total"
+                        )
+                    }
+                }
+            } catch (e: Exception) {
+                dest.delete()
+                throw e
+            }
+        }
+
+        const val MAX_ZIP_ENTRIES = 10_000
+        const val MAX_ENTRY_SIZE_BYTES = 100L * 1024 * 1024  // 100 MB per entry
+        const val MAX_TOTAL_UNCOMPRESSED_BYTES = 500L * 1024 * 1024  // 500 MB total
+
+        /**
+         * ZIPを安全に展開します。
+         *
+         * セキュリティ対策:
+         * - Zip Slip (パストラバーサル / 絶対パス / ドライブ指定) を拒否
+         * - バックスラッシュを含む非標準パスを拒否
+         * - エントリー数・個別サイズ・合計サイズの上限で ZIP Bomb を防止
+         * - 実際の読み込みバイト数で制限を判定 (申告サイズだけに依存しない)
+         * - 重複エントリーによる上書きを防止
+         *
+         * 制限値は定数として分離しており、テスト時に小さな値を渡して
+         * 上限超過を検証できます。
+         */
+        internal fun unzip(
+            zipFile: File,
+            destDir: File,
+            maxEntries: Int = MAX_ZIP_ENTRIES,
+            maxEntrySizeBytes: Long = MAX_ENTRY_SIZE_BYTES,
+            maxTotalUncompressedBytes: Long = MAX_TOTAL_UNCOMPRESSED_BYTES
+        ) {
+            // ZIPマジックナンバーの検証 (PK)
+            zipFile.inputStream().use { input ->
+                val header = ByteArray(4)
+                val read = input.read(header)
+                if (read < 2 || header[0] != 0x50.toByte() || header[1] != 0x4B.toByte()) {
+                    throw IllegalStateException("Not a valid ZIP file: $zipFile")
+                }
+            }
+
+            val canonicalDestDir = destDir.canonicalFile
+            val canonicalRoot = canonicalDestDir.path + File.separator
+            val seenPaths = mutableSetOf<String>()
+            var entryCount = 0
+            var totalUncompressed = 0L
+
+            ZipInputStream(zipFile.inputStream()).use { zis ->
+                var entry = zis.nextEntry
+                while (entry != null) {
+                    entryCount++
+                    if (entryCount > maxEntries) {
+                        throw IllegalStateException("ZIP entry count exceeds limit: $maxEntries")
+                    }
+
+                    val name = entry.name
+                    validateZipEntryName(name)
+
+                    val outFile = File(canonicalDestDir, name).canonicalFile
+                    // 最終的な正規パスが展開先配下であることを確認
+                    require(
+                        outFile.path == canonicalDestDir.path ||
+                            outFile.path.startsWith(canonicalRoot)
+                    ) { "Invalid ZIP entry path (outside destination): $name" }
+
+                    // 重複エントリーの拒否
+                    if (!seenPaths.add(outFile.canonicalPath)) {
+                        throw IllegalStateException("Duplicate ZIP entry: $name")
+                    }
+
+                    if (entry.isDirectory) {
+                        if (!outFile.exists() && !outFile.mkdirs()) {
+                            throw IllegalStateException("Failed to create directory: ${outFile.path}")
+                        }
+                    } else {
+                        // 申告サイズが既知で上限超過の場合は事前拒否
+                        if (entry.size >= 0 && entry.size > maxEntrySizeBytes) {
+                            throw IllegalStateException(
+                                "ZIP entry exceeds size limit: $name (${entry.size} > $maxEntrySizeBytes)"
+                            )
+                        }
+                        val parent = outFile.parentFile
+                        if (parent != null && !parent.exists() && !parent.mkdirs()) {
+                            throw IllegalStateException("Failed to create parent directory: ${parent.path}")
+                        }
+                        if (outFile.exists()) {
+                            throw IllegalStateException("File already exists (duplicate): ${outFile.path}")
+                        }
+                        outFile.outputStream().use { output ->
+                            totalUncompressed = copyWithLimits(
+                                zis, output, maxEntrySizeBytes, totalUncompressed, maxTotalUncompressedBytes
+                            )
+                        }
+                    }
+                    zis.closeEntry()
+                    entry = zis.nextEntry
+                }
+            }
+        }
+
+        /**
+         * ZIPエントリー名を検証します。
+         * パストラバーサル、絶対パス、ドライブ指定、UNC、バックスラッシュ、
+         * 空名、NUL文字を拒否します。
+         */
+        internal fun validateZipEntryName(name: String) {
+            require(name.isNotEmpty()) { "Empty ZIP entry name" }
+            require(!name.contains('\u0000')) { "ZIP entry name contains NUL: $name" }
+            require(!name.contains('\\')) { "ZIP entry name contains backslash: $name" }
+            require(!name.startsWith("/")) { "Absolute ZIP entry path: $name" }
+            if (name.length >= 2 && name[1] == ':' && name[0].isLetter()) {
+                throw IllegalArgumentException("Drive letter in ZIP entry path: $name")
+            }
+            if (name.startsWith("//")) {
+                throw IllegalArgumentException("UNC path in ZIP entry: $name")
+            }
+            val segments = name.split('/')
+            for (seg in segments) {
+                if (seg == ".." || seg == ".") {
+                    throw IllegalArgumentException("Path traversal in ZIP entry: $name")
+                }
+            }
+            require(name.trim('/').isNotEmpty()) { "Empty ZIP entry name: $name" }
+        }
+
+        /**
+         * 入力をストリーミングでコピーしながら、個別サイズと合計サイズを検証します。
+         * 申告サイズだけに依存せず、実際に読み込んだバイト数で判定します。
+         */
+        internal fun copyWithLimits(
+            input: java.io.InputStream,
+            output: java.io.OutputStream,
+            maxEntrySize: Long,
+            totalSoFar: Long,
+            maxTotal: Long
+        ): Long {
+            val buf = ByteArray(8192)
+            var entryBytes = 0L
+            var total = totalSoFar
+            while (true) {
+                val read = input.read(buf)
+                if (read == -1) break
+                if (entryBytes + read > maxEntrySize) {
+                    throw IllegalStateException("ZIP entry exceeds size limit")
+                }
+                if (total + read > maxTotal) {
+                    throw IllegalStateException("ZIP total uncompressed size exceeds limit")
+                }
+                output.write(buf, 0, read)
+                entryBytes += read
+                total += read
+            }
+            return total
+        }
+
         const val DEFAULT_FEED_ID = "sankobus"
 
         /**
