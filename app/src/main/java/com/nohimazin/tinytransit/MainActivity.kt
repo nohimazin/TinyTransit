@@ -620,11 +620,6 @@ fun MainScreen(
                 }
             }
 
-            // ネットワーク状態
-            item {
-                Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))
-            }
-
             // Network state
             item {
                 Text(text = "ネットワーク: $networkStateText", modifier = Modifier.padding(top = 8.dp))

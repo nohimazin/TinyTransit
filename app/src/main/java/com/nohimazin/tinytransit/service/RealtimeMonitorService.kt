@@ -182,7 +182,7 @@ class RealtimeMonitorService : Service() {
 
         serviceScope.launch {
             controller?.latestPredictions?.collectLatest { predictions ->
-                refreshNotification(controller!!)
+                controller?.let { refreshNotification(it) }
             }
         }
 
@@ -305,7 +305,8 @@ class RealtimeMonitorService : Service() {
             // 選択フィルタリングは行わない (全便を表示)
 
             val notificationId = routeNotificationIds.getOrPut(routeKey) {
-                NOTIFICATION_ID_BASE + routeKey.hashCode().and(0x7FFFFFFF) % 1000
+                // NOTIFICATION_ID_BASE (1001) と衝突しないよう 1002 以上を使用
+                NOTIFICATION_ID_BASE + 1 + (routeKey.hashCode().and(0x7FFFFFFF) % 999)
             }
             val feedTimestampMs = feedTimestamp?.let { it * 1000 }
             updateRouteNotification(notificationId, routeName, filtered, feedTimestampMs)

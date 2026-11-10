@@ -536,8 +536,9 @@ class RealtimeUpdateController(
                     if (monitoredSeconds >= 86400) {
                         monitoredDepEpoch = midnight + (monitoredSeconds - 86400) * 1000 + 86400 * 1000
                     }
-                    // 監視停留所をまだ通過していない便のみ対象
-                    if (monitoredDepEpoch <= now) continue
+                    // 監視停留所を通過済みの便は対象外だが、遅延を考慮して
+                    // 30 分以内に予定されていた便は「まだ到着していない可能性」として含める
+                    if (monitoredDepEpoch < now - 30 * 60 * 1000L) continue
 
                     // 便の起点 (最初の停留所) の出発時刻を取得
                     // → 再開タイミングは「起点バス停を出発する 5 分前」基準
