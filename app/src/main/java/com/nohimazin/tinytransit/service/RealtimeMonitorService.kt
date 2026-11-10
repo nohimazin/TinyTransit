@@ -414,6 +414,8 @@ class RealtimeMonitorService : Service() {
         for (notifId in routeNotificationIds.values) {
             nm.cancel(notifId)
         }
+        // フォアグラウンド/進捗/待機通知 (NOTIFICATION_ID_BASE) も明示的にキャンセル
+        nm.cancel(NOTIFICATION_ID_BASE)
         routeNotificationIds.clear()
         monitoredRoutes.clear()
         monitoredRouteNames.clear()

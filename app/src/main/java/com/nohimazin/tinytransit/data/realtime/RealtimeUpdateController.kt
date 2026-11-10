@@ -250,30 +250,45 @@ class RealtimeUpdateController(
                         if (nextDeparture != null) {
                             val msUntilDeparture = nextDeparture - System.currentTimeMillis()
                             // 次の便の出発まで 5 分以上ある場合のみ一時停止し、
-                            // 出発 5 分前から取得を再開する。近い場合は通常取得を行う
-                            // (0 待機での連続取得ループを防ぐ)。
-                            if (msUntilDeparture > 6 * 60 * 1000L) {
+                            // 出発 5 分前から取得を再開する。
+                            // 待機中は isWaiting=true を維持し、通知のちらつきを防ぐ。
+                            if (msUntilDeparture > 5 * 60 * 1000L) {
                                 val resumeAt = nextDeparture - 5 * 60 * 1000L
-                                val waitMs = (resumeAt - System.currentTimeMillis())
-                                    .coerceIn(60_000L, 30 * 60 * 1000L)
-                                _isWaiting.value = true
+                                if (!_isWaiting.value) {
+                                    _isWaiting.value = true
+                                }
                                 _nextResumeEpochMs.value = resumeAt
-                                Log.w(TAG, "Pause: no active bus on monitored routes, waiting ${waitMs}ms (nextDeparture=$nextDeparture)")
+                                // 最大 5 分ごとに再確認 (境界での再待機ループを防ぐ)
+                                val remaining = resumeAt - System.currentTimeMillis()
+                                val waitMs = if (msUntilDeparture > 10 * 60 * 1000L) {
+                                    remaining.coerceIn(1_000L, 30 * 60 * 1000L)
+                                } else {
+                                    remaining.coerceIn(1_000L, 60 * 1000L)
+                                }
+                                Log.w(TAG, "Pause: no active bus, waiting ${waitMs}ms (nextDeparture=$nextDeparture, msUntil=$msUntilDeparture)")
                                 if (waitMs > 0) {
                                     delay(waitMs)
                                 }
-                                _isWaiting.value = false
-                                _nextResumeEpochMs.value = 0L
                                 continue
+                            } else {
+                                // 5 分以内: 待機解除して通常取得
+                                if (_isWaiting.value) {
+                                    _isWaiting.value = false
+                                    _nextResumeEpochMs.value = 0L
+                                }
                             }
                         } else {
                             Log.w(TAG, "Pause: no active bus, nextDeparture unknown, waiting 30min")
-                            _isWaiting.value = true
+                            if (!_isWaiting.value) _isWaiting.value = true
                             _nextResumeEpochMs.value = System.currentTimeMillis() + 30 * 60 * 1000L
                             delay(30 * 60 * 1000L)
+                            continue
+                        }
+                    } else {
+                        // 走行中のバスあり: 待機解除
+                        if (_isWaiting.value) {
                             _isWaiting.value = false
                             _nextResumeEpochMs.value = 0L
-                            continue
                         }
                     }
                 }
@@ -462,6 +477,7 @@ class RealtimeUpdateController(
         }
 
         var nextDeparture: Long? = null
+        var bestMonitoredDepEpoch: Long = Long.MAX_VALUE
 
         // 今日から 7 日先まで走査して、最初の運行日・便の出発時刻を求めます
         for (dayOffset in 0..6) {
@@ -507,22 +523,43 @@ class RealtimeUpdateController(
                     }
                     if (!isActive) continue
 
-                    val depTime = st.departureTime ?: st.arrivalTime ?: continue
-                    val parts = depTime.split(":")
-                    if (parts.size != 3) continue
-                    val h = parts[0].toLongOrNull() ?: continue
-                    val m = parts[1].toLongOrNull() ?: continue
-                    val s = parts[2].toLongOrNull() ?: continue
-                    val seconds = h * 3600 + m * 60 + s
+                    // 監視停留所の出発時刻 (便がこの停留所を通過する時刻)
+                    val monitoredDepTime = st.departureTime ?: st.arrivalTime ?: continue
+                    val mParts = monitoredDepTime.split(":")
+                    if (mParts.size != 3) continue
+                    val mh = mParts[0].toLongOrNull() ?: continue
+                    val mm = mParts[1].toLongOrNull() ?: continue
+                    val ms = mParts[2].toLongOrNull() ?: continue
+                    val monitoredSeconds = mh * 3600 + mm * 60 + ms
 
-                    var depEpoch = midnight + seconds * 1000
-                    // 24h+ の場合
-                    if (seconds >= 86400) {
-                        depEpoch = midnight + (seconds - 86400) * 1000 + 86400 * 1000
+                    var monitoredDepEpoch = midnight + monitoredSeconds * 1000
+                    if (monitoredSeconds >= 86400) {
+                        monitoredDepEpoch = midnight + (monitoredSeconds - 86400) * 1000 + 86400 * 1000
+                    }
+                    // 監視停留所をまだ通過していない便のみ対象
+                    if (monitoredDepEpoch <= now) continue
+
+                    // 便の起点 (最初の停留所) の出発時刻を取得
+                    // → 再開タイミングは「起点バス停を出発する 5 分前」基準
+                    val tripStopTimes = database.stopTimeDao().getByTrip(feedId, st.tripId)
+                    val firstStop = tripStopTimes.minByOrNull { it.stopSequence }
+                    val startDepTime = firstStop?.departureTime ?: firstStop?.arrivalTime ?: monitoredDepTime
+                    val sParts = startDepTime.split(":")
+                    if (sParts.size != 3) continue
+                    val sh = sParts[0].toLongOrNull() ?: continue
+                    val sm = sParts[1].toLongOrNull() ?: continue
+                    val ss = sParts[2].toLongOrNull() ?: continue
+                    val startSeconds = sh * 3600 + sm * 60 + ss
+
+                    var startDepEpoch = midnight + startSeconds * 1000
+                    if (startSeconds >= 86400) {
+                        startDepEpoch = midnight + (startSeconds - 86400) * 1000 + 86400 * 1000
                     }
 
-                    if (depEpoch > now && (nextDeparture == null || depEpoch < nextDeparture)) {
-                        nextDeparture = depEpoch
+                    // 最も近い monitored 出発の便を選び、その起点出発時刻を返す
+                    if (nextDeparture == null || monitoredDepEpoch < bestMonitoredDepEpoch) {
+                        bestMonitoredDepEpoch = monitoredDepEpoch
+                        nextDeparture = startDepEpoch
                     }
                 }
             }

@@ -647,7 +647,7 @@ fun MainScreen(
                     }
                 }
                 Text(
-                    text = "ONにすると、監視対象の路線で現在走行中のバスがない場合、通信を一時停止し、次の便の出発予定時刻の5分前から自動で再開します（最大30分ごとに確認）。通信量を節約できます。",
+                    text = "ONにすると、監視対象の路線で現在走行中のバスがない場合、通信を一時停止し、次の便が起点バス停を出発する5分前から自動で再開します（最大30分ごとに確認）。通信量を節約できます。",
                     modifier = Modifier.padding(top = 4.dp),
                     style = androidx.compose.material3.MaterialTheme.typography.bodySmall
                 )
