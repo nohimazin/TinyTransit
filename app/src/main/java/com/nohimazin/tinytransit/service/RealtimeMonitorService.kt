@@ -90,6 +90,12 @@ class RealtimeMonitorService : Service() {
                     val parts = r.split("->")
                     parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
                 }.toSet())
+                // フォアグラウンド通知 (追跡対象一覧) を更新
+                try {
+                    NotificationManagerCompat.from(this).notify(NOTIFICATION_ID_BASE, buildForegroundNotification())
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Notification permission denied: ${e.message}")
+                }
                 controller?.let { ctrl ->
                     serviceScope.launch { refreshNotification(ctrl) }
                 }
@@ -121,6 +127,12 @@ class RealtimeMonitorService : Service() {
                     val parts = r.split("->")
                     parts.getOrElse(0) { "" } to parts.getOrElse(1) { parts.getOrElse(0) { "" } }
                 }.toSet())
+                // フォアグラウンド通知 (追跡対象一覧) を更新
+                try {
+                    NotificationManagerCompat.from(this).notify(NOTIFICATION_ID_BASE, buildForegroundNotification())
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Notification permission denied: ${e.message}")
+                }
                 controller?.let { ctrl ->
                     serviceScope.launch { refreshNotification(ctrl) }
                 }
@@ -189,15 +201,21 @@ class RealtimeMonitorService : Service() {
         // ダウンロード進捗を監視して通知を更新
         serviceScope.launch {
             controller?.downloadProgress?.collectLatest { progress ->
-                if (progress != null && RealtimeUpdateController.isShowDownloadProgress(this@RealtimeMonitorService)) {
-                    val (downloaded, total) = progress
-                    val notification = buildProgressNotification(downloaded, total)
-                    val nm = NotificationManagerCompat.from(this@RealtimeMonitorService)
-                    try {
+                val nm = NotificationManagerCompat.from(this@RealtimeMonitorService)
+                try {
+                    if (progress != null && RealtimeUpdateController.isShowDownloadProgress(this@RealtimeMonitorService)) {
+                        val (downloaded, total) = progress
+                        val notification = buildProgressNotification(downloaded, total)
                         nm.notify(NOTIFICATION_ID_BASE, notification)
-                    } catch (e: SecurityException) {
-                        Log.w(TAG, "Notification permission denied: ${e.message}")
+                    } else if (progress == null) {
+                        // ダウンロード完了: フォアグラウンド通知 (追跡対象一覧) に戻す
+                        // (待機モード中は isWaiting 側で管理するため、待機中は上書きしない)
+                        if (controller?.isWaiting?.value != true) {
+                            nm.notify(NOTIFICATION_ID_BASE, buildForegroundNotification())
+                        }
                     }
+                } catch (e: SecurityException) {
+                    Log.w(TAG, "Notification permission denied: ${e.message}")
                 }
             }
         }
